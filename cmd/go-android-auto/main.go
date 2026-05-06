@@ -450,12 +450,6 @@ func displaySerials(serials []string) []string {
 	return displayed
 }
 
-func usage() {
-	cfg := commandConfig{}
-	flags := parseFlags(&cfg, nil)
-	flags.Usage()
-}
-
 func parseFlags(cfg *commandConfig, args []string) *flag.FlagSet {
 	configPaths, err := defaultAppConfigPaths()
 	if err != nil {
