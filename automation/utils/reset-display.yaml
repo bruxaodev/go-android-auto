@@ -1,0 +1,9 @@
+- name: reset resolution
+  type: adb
+  action: reset-size
+  wait_after: 500ms
+
+- name: reset density
+  type: adb
+  action: reset-density
+  wait_after: 500ms

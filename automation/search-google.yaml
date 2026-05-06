@@ -1,0 +1,19 @@
+- fallback: utils/reset-display.yaml
+
+- name: setup device
+  type: timeline
+  timeline: utils/setup-device.yaml
+
+- name: home
+  type: adb
+  action: home
+  wait_after: 500ms
+
+- name: open clear google
+  type: timeline
+  timeline: utils/chrome/clear-open.yaml
+
+- name: search
+  type: timeline
+  timeline: utils/chrome/search.yaml
+

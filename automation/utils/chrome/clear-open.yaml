@@ -1,0 +1,18 @@
+- name: clear chrome data
+  type: adb
+  action: shell
+  args:
+    - pm
+    - clear
+    - com.google.android.googlequicksearchbox
+  wait_after: 2s
+
+- name: open google search
+  type: adb
+  action: shell
+  args:
+    - am
+    - start
+    - -n
+    - com.google.android.googlequicksearchbox/com.google.android.googlequicksearchbox.SearchActivity
+  wait_after: 2s

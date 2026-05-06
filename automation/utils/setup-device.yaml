@@ -1,0 +1,32 @@
+- name: set resolution
+  type: adb
+  action: set-size
+  size: 1080x2400
+  wait_after: 500ms
+
+- name: set density
+  type: adb
+  action: set-density
+  size: 400
+  wait_after: 500ms
+
+- name: set 3-button navigation
+  type: adb
+  action: shell
+  args:
+    - cmd
+    - overlay
+    - enable
+    - com.android.internal.systemui.navbar.threebutton
+  wait_after: 500ms
+
+- name: set proxy
+  type: adb
+  action: shell
+  args:
+    - settings
+    - put
+    - global
+    - http_proxy
+    - '{{proxy.proxy}}'
+  wait_after: 500ms

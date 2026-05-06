@@ -1,0 +1,5 @@
+- name: search google
+  type: adb
+  action: text
+  text: '{{search.query}}'
+  wait_after: 2s
