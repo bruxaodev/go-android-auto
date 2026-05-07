@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"unicode"
@@ -61,6 +62,15 @@ type ocrLine struct {
 	key   string
 	words []ocrWord
 }
+
+type targetSelector struct {
+	Raw        string
+	Normalized string
+	Index      int
+	Indexed    bool
+}
+
+var indexedTargetPattern = regexp.MustCompile(`^\[(\d+)\]\."([^"]+)"$`)
 
 type Engine interface {
 	FindText(ctx context.Context, imagePath string, target string, options Options) (*Bounds, error)
@@ -230,9 +240,11 @@ func (t *Tesseract) psmValues(psm int) []int {
 }
 
 func (t *Tesseract) findTextBoundsFromTSV(input io.Reader, target string) (*Bounds, error) {
-	rawTarget := strings.TrimSpace(target)
-	target = normalizeText(target)
-	if target == "" {
+	selector, err := parseTargetSelector(target)
+	if err != nil {
+		return nil, err
+	}
+	if selector.Normalized == "" {
 		return nil, fmt.Errorf("target text is empty after normalization")
 	}
 
@@ -295,19 +307,67 @@ func (t *Tesseract) findTextBoundsFromTSV(input io.Reader, target string) (*Boun
 		visibleLines = append(visibleLines, text)
 	}
 
+	if selector.Indexed {
+		bounds, count := findIndexedBounds(lines, selector, true)
+		if bounds != nil {
+			return bounds, nil
+		}
+		if count > 0 {
+			return nil, fmt.Errorf("target occurrence [%d].%q not found in OCR results: found %d exact occurrence(s)\nVisible lines: %v", selector.Index, selector.Raw, count, visibleLines)
+		}
+		bounds, count = findIndexedBounds(lines, selector, false)
+		if bounds != nil {
+			return bounds, nil
+		}
+		return nil, fmt.Errorf("target occurrence [%d].%q not found in OCR results: found %d occurrence(s)\nVisible lines: %v", selector.Index, selector.Raw, count, visibleLines)
+	}
+
 	for _, line := range lines {
-		if bounds := line.findBounds(rawTarget, target, true); bounds != nil {
+		if bounds := line.findBounds(selector.Raw, selector.Normalized, true); bounds != nil {
 			return bounds, nil
 		}
 	}
 
 	for _, line := range lines {
-		if bounds := line.findBounds(rawTarget, target, false); bounds != nil {
+		if bounds := line.findBounds(selector.Raw, selector.Normalized, false); bounds != nil {
 			return bounds, nil
 		}
 	}
 
-	return nil, fmt.Errorf("target text not found in OCR results: %s\nVisible lines: %v", target, visibleLines)
+	return nil, fmt.Errorf("target text not found in OCR results: %s\nVisible lines: %v", selector.Normalized, visibleLines)
+}
+
+func parseTargetSelector(target string) (targetSelector, error) {
+	rawTarget := strings.TrimSpace(target)
+	selector := targetSelector{Raw: rawTarget, Normalized: normalizeText(rawTarget)}
+	matches := indexedTargetPattern.FindStringSubmatch(rawTarget)
+	if len(matches) == 0 {
+		return selector, nil
+	}
+
+	index, err := strconv.Atoi(matches[1])
+	if err != nil {
+		return targetSelector{}, fmt.Errorf("invalid target occurrence index %q: %w", matches[1], err)
+	}
+	selector.Raw = matches[2]
+	selector.Normalized = normalizeText(matches[2])
+	selector.Index = index
+	selector.Indexed = true
+	return selector, nil
+}
+
+func findIndexedBounds(lines []ocrLine, selector targetSelector, exact bool) (*Bounds, int) {
+	matchIndex := 0
+	for _, line := range lines {
+		matches := line.findAllBounds(selector.Raw, selector.Normalized, exact)
+		for _, bounds := range matches {
+			if matchIndex == selector.Index {
+				return bounds, matchIndex + 1
+			}
+			matchIndex++
+		}
+	}
+	return nil, matchIndex
 }
 
 func normalizeText(text string) string {
@@ -428,6 +488,15 @@ func (l ocrLine) bounds() *Bounds {
 }
 
 func (l ocrLine) findBounds(rawTarget, target string, exact bool) *Bounds {
+	matches := l.findAllBounds(rawTarget, target, exact)
+	if len(matches) == 0 {
+		return nil
+	}
+	return matches[0]
+}
+
+func (l ocrLine) findAllBounds(rawTarget, target string, exact bool) []*Bounds {
+	matches := make([]*Bounds, 0)
 	for length := 1; length <= len(l.words); length++ {
 		for start := 0; start+length <= len(l.words); start++ {
 			words := l.words[start : start+length]
@@ -437,19 +506,22 @@ func (l ocrLine) findBounds(rawTarget, target string, exact bool) *Bounds {
 			}
 			text := strings.Join(parts, " ")
 			if exact && text == rawTarget {
-				return wordsBounds(words)
+				matches = append(matches, wordsBounds(words))
 			}
 			if exact {
 				continue
 			}
 
 			if strings.Contains(normalizeText(text), target) {
-				return wordsBounds(words)
+				matches = append(matches, wordsBounds(words))
 			}
+		}
+		if len(matches) > 0 {
+			return matches
 		}
 	}
 
-	return nil
+	return matches
 }
 
 func wordsBounds(words []ocrWord) *Bounds {

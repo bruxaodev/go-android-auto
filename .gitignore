@@ -1,1 +1,3 @@
 .tmp/
+.vscode/
+device-map.json

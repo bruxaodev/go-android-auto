@@ -49,6 +49,44 @@ func TestFindTextBoundsFromTSVReturnsMatchingWordBounds(t *testing.T) {
 	}
 }
 
+func TestFindTextBoundsFromTSVSelectsZeroBasedIndexedRepeatedText(t *testing.T) {
+	tsv := strings.Join([]string{
+		"level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext",
+		"5\t1\t1\t1\t1\t1\t10\t100\t30\t20\t96\tpalavra",
+		"5\t1\t1\t1\t1\t2\t60\t100\t30\t20\t96\tpalavra",
+		"5\t1\t1\t1\t2\t1\t10\t160\t30\t20\t96\tpalavra",
+		"5\t1\t1\t1\t2\t2\t80\t160\t40\t24\t96\tpalavra",
+	}, "\n")
+
+	bounds, err := (&Tesseract{}).findTextBoundsFromTSV(strings.NewReader(tsv), `[3]."palavra"`)
+	if err != nil {
+		t.Fatalf("findTextBoundsFromTSV returned error: %v", err)
+	}
+
+	if bounds == nil {
+		t.Fatal("expected bounds, got nil")
+	}
+
+	if bounds.Left != 80 || bounds.Top != 160 || bounds.Right != 120 || bounds.Bottom != 184 {
+		t.Fatalf("unexpected bounds: %+v", bounds)
+	}
+}
+
+func TestFindTextBoundsFromTSVReturnsErrorForMissingIndexedOccurrence(t *testing.T) {
+	tsv := strings.Join([]string{
+		"level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext",
+		"5\t1\t1\t1\t1\t1\t10\t100\t30\t20\t96\tpalavra",
+	}, "\n")
+
+	_, err := (&Tesseract{}).findTextBoundsFromTSV(strings.NewReader(tsv), `[3]."palavra"`)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), `target occurrence [3]."palavra" not found`) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestFindTextBoundsFromTSVPrefersExactCaseMatches(t *testing.T) {
 	tsv := strings.Join([]string{
 		"level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext",

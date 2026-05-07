@@ -344,6 +344,26 @@ func TestRunnerWaitsForOCRTextThenTaps(t *testing.T) {
 	require.Equal(t, []string{"adb screenshot", "adb screenshot", "adb screenshot", "adb tap 0 0"}, events.values())
 }
 
+func TestRunnerTapsIndexedRepeatedOCRTarget(t *testing.T) {
+	events := timelineEvents{}
+	runner := Runner{
+		Device: &recordingDevice{events: &events},
+		Ocr: targetOCR{
+			targets: map[string]bool{`[3]."palavra"`: true},
+			bounds: map[string]ocr.Bounds{
+				`[3]."palavra"`: {Left: 80, Top: 160, Right: 120, Bottom: 184},
+			},
+		},
+	}
+
+	err := runner.Run(context.Background(), Timeline{
+		{Type: CommandOCR, Action: ActionTap, Find: `[3]."palavra"`},
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, []string{"adb screenshot", "adb tap 100 172"}, events.values())
+}
+
 func TestRunnerRunFromReportsAbsoluteCommandIndex(t *testing.T) {
 	runner := Runner{
 		Device: &recordingDevice{},
@@ -758,10 +778,14 @@ func (t textOCR) Text(context.Context, string, ocr.Options) (string, error) { re
 type targetOCR struct {
 	text    string
 	targets map[string]bool
+	bounds  map[string]ocr.Bounds
 }
 
 func (t targetOCR) FindText(_ context.Context, _ string, target string, _ ocr.Options) (*ocr.Bounds, error) {
 	if t.targets[target] {
+		if bounds, ok := t.bounds[target]; ok {
+			return &bounds, nil
+		}
 		return &ocr.Bounds{}, nil
 	}
 	return nil, errors.New("not found")
