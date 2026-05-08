@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -276,6 +277,11 @@ func TestRunnerInterleavesADBAndAppiumActions(t *testing.T) {
 			require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
 			require.Equal(t, "device-a", body.Capabilities.AlwaysMatch["appium:udid"])
 			require.Equal(t, float64(8201), body.Capabilities.AlwaysMatch["appium:systemPort"])
+			require.Equal(t, float64(9201), body.Capabilities.AlwaysMatch["appium:mjpegServerPort"])
+			require.Equal(t, float64(120000), body.Capabilities.AlwaysMatch["appium:adbExecTimeout"])
+			require.Equal(t, float64(120000), body.Capabilities.AlwaysMatch["appium:androidInstallTimeout"])
+			require.Equal(t, float64(120000), body.Capabilities.AlwaysMatch["appium:uiautomator2ServerInstallTimeout"])
+			require.Equal(t, float64(120000), body.Capabilities.AlwaysMatch["appium:uiautomator2ServerLaunchTimeout"])
 			require.Equal(t, "com.example", body.Capabilities.AlwaysMatch["appium:appPackage"])
 			events.append("appium session")
 			_, _ = w.Write([]byte(`{"value":{"sessionId":"session-1","capabilities":{}}}`))
@@ -690,6 +696,71 @@ func TestRunnerWaitsForAppiumElementThenInputs(t *testing.T) {
 		"POST /session/session-1/element/element-1/value",
 		"DELETE /session/session-1",
 	}, requests)
+}
+
+func TestRunnerSerializesAppiumSessionCreation(t *testing.T) {
+	var active atomic.Int32
+	var maxActive atomic.Int32
+	var sessions atomic.Int32
+	var firstSession sync.Once
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/session":
+			current := active.Add(1)
+			for {
+				max := maxActive.Load()
+				if current <= max || maxActive.CompareAndSwap(max, current) {
+					break
+				}
+			}
+			firstSession.Do(func() {
+				time.Sleep(50 * time.Millisecond)
+			})
+			id := sessions.Add(1)
+			active.Add(-1)
+			_, _ = w.Write([]byte(`{"value":{"sessionId":"session-` + strconv.Itoa(int(id)) + `","capabilities":{}}}`))
+		case r.Method == http.MethodDelete:
+			_, _ = w.Write([]byte(`{"value":null}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	for _, variables := range []map[string]string{
+		{"device.index": "0", "device.serial": "device-a"},
+		{"device.index": "1", "device.serial": "device-b"},
+	} {
+		variables := variables
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			runner := Runner{Device: &recordingDevice{}, Ocr: fakeOCR{}, AppiumServerURL: server.URL, Output: io.Discard, Variables: variables}
+			errs <- runner.Run(context.Background(), Timeline{{Type: CommandAppium, Action: ActionStartSession}})
+		}()
+	}
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		require.NoError(t, err)
+	}
+	require.Equal(t, int32(1), maxActive.Load())
+	require.Equal(t, int32(2), sessions.Load())
+}
+
+func TestAddGoogleAccountAppiumTimelineAttachesToCurrentScreen(t *testing.T) {
+	timeline, err := Load(filepath.Join("..", "..", "automation", "add-google-account-appium.yaml"))
+	require.NoError(t, err)
+	require.NotEmpty(t, timeline)
+
+	startSession := timeline[1]
+	require.Equal(t, ActionStartSession, startSession.Action)
+	require.Equal(t, false, startSession.Capabilities["appium:autoLaunch"])
+	require.NotContains(t, startSession.Capabilities, "appium:appPackage")
 }
 
 type timelineEvents struct {

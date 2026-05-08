@@ -7,6 +7,7 @@ import (
 	"hash/fnv"
 	"io"
 	"maps"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -50,11 +51,16 @@ type Runner struct {
 var variablePattern = regexp.MustCompile(`\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}`)
 
 const (
-	defaultWaitTimeout  = 30 * time.Second
-	defaultWaitInterval = time.Second
+	defaultWaitTimeout          = 30 * time.Second
+	defaultWaitInterval         = time.Second
+	defaultAppiumSessionTimeout = 2 * time.Minute
+	defaultAppiumTimeoutMS      = 120000
 )
 
-var ocrOperationSlots = make(chan struct{}, 1)
+var (
+	ocrOperationSlots          = make(chan struct{}, 1)
+	appiumSessionCreationSlots = make(chan struct{}, 1)
+)
 
 type CommandType string
 
@@ -1199,7 +1205,14 @@ func (r *Runner) ensureAppiumSession(ctx context.Context, c Command) (*appium.Se
 
 	capabilities := r.defaultAppiumCapabilities()
 	maps.Copy(capabilities, c.Capabilities)
-	session, err := client.CreateSession(ctx, capabilities)
+	logAppiumSessionStart(r.Output, client.ServerURL, capabilities)
+	if err := acquireAppiumSessionCreationSlot(ctx); err != nil {
+		return nil, err
+	}
+	defer func() { <-appiumSessionCreationSlots }()
+	sessionCtx, cancel := context.WithTimeout(ctx, defaultAppiumSessionTimeout)
+	defer cancel()
+	session, err := client.CreateSession(sessionCtx, capabilities)
 	if err != nil {
 		return nil, err
 	}
@@ -1207,11 +1220,46 @@ func (r *Runner) ensureAppiumSession(ctx context.Context, c Command) (*appium.Se
 	return session, nil
 }
 
+func acquireAppiumSessionCreationSlot(ctx context.Context) error {
+	select {
+	case appiumSessionCreationSlots <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func logAppiumSessionStart(output io.Writer, serverURL string, capabilities map[string]any) {
+	if output == nil {
+		output = os.Stdout
+	}
+	parts := []string{"[appium] creating session", "server " + safeAppiumServerURL(serverURL)}
+	for _, key := range []string{"appium:udid", "appium:systemPort", "appium:mjpegServerPort"} {
+		if value, ok := capabilities[key]; ok {
+			parts = append(parts, strings.TrimPrefix(key, "appium:")+" "+fmt.Sprint(value))
+		}
+	}
+	fmt.Fprintln(output, strings.Join(parts, " | "))
+}
+
+func safeAppiumServerURL(serverURL string) string {
+	parsed, err := url.Parse(strings.TrimSpace(serverURL))
+	if err != nil || parsed.User == nil {
+		return serverURL
+	}
+	parsed.User = url.User("redacted")
+	return parsed.String()
+}
+
 func (r *Runner) defaultAppiumCapabilities() map[string]any {
 	capabilities := map[string]any{
-		"platformName":          "Android",
-		"appium:automationName": "UiAutomator2",
-		"appium:noReset":        true,
+		"platformName":                            "Android",
+		"appium:automationName":                   "UiAutomator2",
+		"appium:noReset":                          true,
+		"appium:adbExecTimeout":                   defaultAppiumTimeoutMS,
+		"appium:androidInstallTimeout":            defaultAppiumTimeoutMS,
+		"appium:uiautomator2ServerInstallTimeout": defaultAppiumTimeoutMS,
+		"appium:uiautomator2ServerLaunchTimeout":  defaultAppiumTimeoutMS,
 	}
 	if r.Variables == nil {
 		return capabilities
@@ -1222,6 +1270,7 @@ func (r *Runner) defaultAppiumCapabilities() map[string]any {
 	}
 	if index, err := strconv.Atoi(r.Variables["device.index"]); err == nil && index >= 0 {
 		capabilities["appium:systemPort"] = 8200 + index
+		capabilities["appium:mjpegServerPort"] = 9200 + index
 	}
 	return capabilities
 }
