@@ -55,6 +55,27 @@ func TestParseFlagsDefaultsAppiumCommand(t *testing.T) {
 	require.Equal(t, "appium", cfg.appiumCommand)
 }
 
+func TestParseFlagsDefaultsDeviceRunModeParallel(t *testing.T) {
+	setTestConfigHome(t)
+	cfg := commandConfig{}
+	parseFlags(&cfg, nil)
+
+	require.Equal(t, deviceRunModeParallel, cfg.deviceRunMode)
+}
+
+func TestNormalizeDeviceRunMode(t *testing.T) {
+	parallel, err := normalizeDeviceRunMode("parallel")
+	require.NoError(t, err)
+	require.Equal(t, deviceRunModeParallel, parallel)
+
+	queue, err := normalizeDeviceRunMode("serial")
+	require.NoError(t, err)
+	require.Equal(t, deviceRunModeQueue, queue)
+
+	_, err = normalizeDeviceRunMode("bad")
+	require.Error(t, err)
+}
+
 func TestParseFlagsIgnoresLocalConfigFiles(t *testing.T) {
 	paths := setTestConfigHome(t)
 	workDir := t.TempDir()
@@ -160,6 +181,13 @@ func TestAppiumServerURLsAutoSizesByDeviceCount(t *testing.T) {
 	require.Len(t, urls, 3)
 	require.Equal(t, "http://127.0.0.1:4723", urls[0])
 	require.Equal(t, "http://127.0.0.1:4725", urls[2])
+}
+
+func TestAppiumServerURLsQueueModeUsesSingleAutoShard(t *testing.T) {
+	urls, err := appiumServerURLs(commandConfig{deviceRunMode: deviceRunModeQueue}, 21)
+
+	require.NoError(t, err)
+	require.Equal(t, []string{"http://127.0.0.1:4723"}, urls)
 }
 
 func TestAssignAppiumTargetsRoundRobinsURLsAndPortIndexes(t *testing.T) {
@@ -566,6 +594,24 @@ func TestRunTimelineOnDevicesContinuesAndRunsFallbackOnFailedDevice(t *testing.T
 	require.NotContains(t, logContent, "-s device-b shell reset-display")
 }
 
+func TestRunTimelineOnDevicesQueueRunsOneDeviceAtATime(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "adb.log")
+	adbPath := createSlowTimelineADB(t, logPath)
+	cfg := commandConfig{adbPath: adbPath, deviceLogDir: "", deviceRunMode: deviceRunModeQueue}
+	timeline := auto.Timeline{{Type: auto.CommandADB, Action: auto.ActionShell, Args: []string{"slow-main"}}}
+	targets := []deviceTarget{
+		{Serial: "device-a", DataIndex: 0},
+		{Serial: "device-b", DataIndex: 1},
+	}
+
+	err := runTimelineOnDevices(context.Background(), cfg, timeline, nil, nil, targets)
+
+	require.NoError(t, err)
+	content, readErr := os.ReadFile(logPath)
+	require.NoError(t, readErr)
+	require.Equal(t, []string{"device-a start", "device-a end", "device-b start", "device-b end"}, strings.FieldsFunc(strings.TrimSpace(string(content)), func(r rune) bool { return r == '\n' }))
+}
+
 func TestRunTimelineOnDevicesWritesPerDeviceLogs(t *testing.T) {
 	logDir := filepath.Join(t.TempDir(), "logs")
 	adbPath := createFailingTimelineADB(t, filepath.Join(t.TempDir(), "adb.log"))
@@ -733,6 +779,21 @@ printf '%s\n' "$*" >> ` + strconv.Quote(logPath) + `
 case "$*" in
   *"-s device-a shell fail-main"*) exit 7 ;;
 esac
+`
+	require.NoError(t, os.WriteFile(adbPath, []byte(script), 0o755))
+	return adbPath
+}
+
+func createSlowTimelineADB(t *testing.T, logPath string) string {
+	t.Helper()
+
+	adbPath := filepath.Join(t.TempDir(), "adb")
+	script := `#!/bin/sh
+serial=""
+if [ "$1" = "-s" ]; then serial="$2"; fi
+printf '%s start\n' "$serial" >> ` + strconv.Quote(logPath) + `
+sleep 0.05
+printf '%s end\n' "$serial" >> ` + strconv.Quote(logPath) + `
 `
 	require.NoError(t, os.WriteFile(adbPath, []byte(script), 0o755))
 	return adbPath

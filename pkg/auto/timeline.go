@@ -127,6 +127,7 @@ type Command struct {
 	Args          []string       `yaml:"args,omitempty"`
 	Screenshot    string         `yaml:"screenshot,omitempty"`
 	Output        string         `yaml:"output,omitempty"`
+	OutputKey     string         `yaml:"output_key,omitempty"`
 	OCRLang       string         `yaml:"ocr_lang,omitempty"`
 	OCRPSM        int            `yaml:"ocr_psm,omitempty"`
 	AppiumURL     string         `yaml:"appium_url,omitempty"`
@@ -480,6 +481,9 @@ func (c Command) resolve(variables map[string]string) (Command, error) {
 	if c.Output, err = resolveVariables(c.Output, variables); err != nil {
 		return Command{}, fmt.Errorf("output: %w", err)
 	}
+	if c.OutputKey, err = resolveVariables(c.OutputKey, variables); err != nil {
+		return Command{}, fmt.Errorf("output_key: %w", err)
+	}
 	if c.OCRLang, err = resolveVariables(c.OCRLang, variables); err != nil {
 		return Command{}, fmt.Errorf("ocr_lang: %w", err)
 	}
@@ -808,20 +812,25 @@ func (c Command) captureOCRValue(ctx context.Context, device Device, engine ocr.
 		return "", err
 	}
 
-	pattern, err := regexp.Compile(c.Find)
+	return captureRegexValue(c.Find, text, "OCR text")
+}
+
+func captureRegexValue(find string, text string, sourceName string) (string, error) {
+	pattern, err := regexp.Compile(find)
 	if err != nil {
 		return "", fmt.Errorf("compile capture regex: %w", err)
 	}
 	matches := pattern.FindStringSubmatch(text)
 	if len(matches) == 0 {
-		return "", fmt.Errorf("capture regex %q did not match OCR text: %s", c.Find, strings.TrimSpace(text))
+		return "", fmt.Errorf("capture regex %q did not match %s: %s", find, sourceName, strings.TrimSpace(text))
 	}
 
-	captured := matches[0]
-	if len(matches) > 1 {
-		captured = matches[1]
+	for _, match := range matches[1:] {
+		if strings.TrimSpace(match) != "" {
+			return strings.TrimSpace(match), nil
+		}
 	}
-	return strings.TrimSpace(captured), nil
+	return strings.TrimSpace(matches[0]), nil
 }
 
 func (c Command) saveOutputValue(variables map[string]string, value string, dataDir string) error {
@@ -835,13 +844,18 @@ func (c Command) saveOutputValue(variables map[string]string, value string, data
 			return err
 		}
 		setOutputValueVariables(variables, output, value)
+		setOutputKeyVariables(variables, c.OutputKey, value)
 		return nil
 	}
 
 	if err := os.MkdirAll(filepath.Dir(c.Output), 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(c.Output, []byte(value+"\n"), 0o644)
+	if err := os.WriteFile(c.Output, []byte(value+"\n"), 0o644); err != nil {
+		return err
+	}
+	setOutputKeyVariables(variables, c.OutputKey, value)
+	return nil
 }
 
 func (c Command) generateIdentifierOCR(ctx context.Context, device Device, engine ocr.Engine, variables map[string]string, dataDir string) error {
@@ -909,6 +923,19 @@ func setOutputValueVariables(variables map[string]string, output string, value s
 	baseKey := key + "." + valueHeader
 	setVariable(variables, baseKey, value)
 	setDerivedVariables(variables, baseKey, value)
+	setVariable(variables, key, value)
+	setDerivedVariables(variables, key, value)
+}
+
+func setOutputKeyVariables(variables map[string]string, outputKey string, value string) {
+	if variables == nil {
+		return
+	}
+	key := normalizeVariableKey(outputKey)
+	if key == "" {
+		return
+	}
+	value = strings.TrimSpace(value)
 	setVariable(variables, key, value)
 	setDerivedVariables(variables, key, value)
 }
@@ -1122,12 +1149,17 @@ func (c Command) runAppium(ctx context.Context, r *Runner) error {
 			return err
 		}
 		return os.WriteFile(c.Output, []byte(source), 0o644)
+	case ActionCapture:
+		return c.captureAppiumSource(ctx, r)
 	case ActionWait:
 		if strings.TrimSpace(c.Find) == "" {
 			if c.Then != "" {
 				return fmt.Errorf("then requires find for appium wait")
 			}
 			return c.sleep(ctx, "wait", c.Text)
+		}
+		if c.Then == ActionCapture {
+			return c.waitForAppiumCapture(ctx, r)
 		}
 		session, elementID, err := c.waitForAppiumElement(ctx, r)
 		if err != nil {
@@ -1137,6 +1169,53 @@ func (c Command) runAppium(ctx context.Context, r *Runner) error {
 	default:
 		return fmt.Errorf("unsupported appium action %q", c.Action)
 	}
+}
+
+func (c Command) captureAppiumSource(ctx context.Context, r *Runner) error {
+	if strings.TrimSpace(c.Find) == "" {
+		return fmt.Errorf("find is required for appium %s", c.Action)
+	}
+	if strings.TrimSpace(c.Output) == "" {
+		return fmt.Errorf("output is required for appium %s", c.Action)
+	}
+
+	captured, err := c.captureAppiumValue(ctx, r)
+	if err != nil {
+		return err
+	}
+	return c.saveOutputValue(r.Variables, captured, r.DataDir)
+}
+
+func (c Command) waitForAppiumCapture(ctx context.Context, r *Runner) error {
+	if strings.TrimSpace(c.Output) == "" {
+		return fmt.Errorf("output is required for appium %s", c.Then)
+	}
+
+	var captured string
+	err := c.waitForCondition(ctx, fmt.Sprintf("appium capture regex %q", c.Find), func(ctx context.Context) error {
+		var err error
+		captured, err = c.captureAppiumValue(ctx, r)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	return c.saveOutputValue(r.Variables, captured, r.DataDir)
+}
+
+func (c Command) captureAppiumValue(ctx context.Context, r *Runner) (string, error) {
+	if strings.TrimSpace(c.Find) == "" {
+		return "", fmt.Errorf("find is required for appium %s", c.Action)
+	}
+	session, err := r.ensureAppiumSession(ctx, c)
+	if err != nil {
+		return "", err
+	}
+	source, err := session.PageSource(ctx)
+	if err != nil {
+		return "", err
+	}
+	return captureRegexValue(c.Find, source, "Appium page source")
 }
 
 func (c Command) waitForAppiumElement(ctx context.Context, r *Runner) (*appium.Session, string, error) {

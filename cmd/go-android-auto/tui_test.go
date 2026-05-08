@@ -47,6 +47,7 @@ func TestSelectedRunConfigUsesSelectedScriptDevicesAndOptions(t *testing.T) {
 		scriptIndex:              0,
 		fallbackScriptIndex:      1,
 		detectDeviceIDs:          true,
+		deviceRunMode:            deviceRunModeQueue,
 		startIndex:               3,
 		appiumShards:             4,
 		appiumSessionConcurrency: 8,
@@ -59,6 +60,7 @@ func TestSelectedRunConfigUsesSelectedScriptDevicesAndOptions(t *testing.T) {
 	require.Equal(t, "/config/automation/fallback.yaml", cfg.fallbackPath)
 	require.Equal(t, "device-a,device-b", cfg.deviceSerials)
 	require.True(t, cfg.detectDeviceIDs)
+	require.Equal(t, deviceRunModeQueue, cfg.deviceRunMode)
 	require.Equal(t, 3, cfg.timeLineIndex)
 	require.Equal(t, 4, cfg.appiumShards)
 	require.Equal(t, 8, cfg.appiumSessionConcurrency)
@@ -94,6 +96,7 @@ func TestTUIViewShowsAppiumOptions(t *testing.T) {
 		scripts:                  []tuiScript{{Name: "first.yaml", Path: "first.yaml"}},
 		devices:                  []tuiDevice{{ID: 1, Serial: "device-a", Name: "Alpha"}},
 		selectedDevices:          map[int]bool{0: true},
+		deviceRunMode:            deviceRunModeQueue,
 		appiumShards:             10,
 		appiumSessionConcurrency: 5,
 	}
@@ -103,6 +106,17 @@ func TestTUIViewShowsAppiumOptions(t *testing.T) {
 	require.Contains(t, view, "appium shards: 10")
 	require.Contains(t, view, "appium sessions: 5")
 	require.Contains(t, view, "appium urls: auto")
+	require.Contains(t, view, "device run mode: queue")
+}
+
+func TestTUITogglesDeviceRunMode(t *testing.T) {
+	m := tuiModel{deviceRunMode: deviceRunModeParallel}
+
+	m.toggleDeviceRunMode()
+	require.Equal(t, deviceRunModeQueue, m.deviceRunMode)
+
+	m.toggleDeviceRunMode()
+	require.Equal(t, deviceRunModeParallel, m.deviceRunMode)
 }
 
 func TestTUIEditsAppiumURLs(t *testing.T) {

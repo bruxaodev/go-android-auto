@@ -699,6 +699,125 @@ func TestRunnerWaitsForAppiumElementThenInputs(t *testing.T) {
 	}, requests)
 }
 
+func TestRunnerCapturesAppiumRegexToCSV(t *testing.T) {
+	dataDir := t.TempDir()
+	requests := make([]string, 0)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case "POST /session":
+			_, _ = w.Write([]byte(`{"value":{"sessionId":"session-1","capabilities":{}}}`))
+		case "GET /session/session-1/source":
+			_, _ = w.Write([]byte(`{"value":"<hierarchy><node text='Seu código de verificação é 583921'/></hierarchy>"}`))
+		case "DELETE /session/session-1":
+			_, _ = w.Write([]byte(`{"value":null}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	runner := Runner{
+		Device:          &recordingDevice{},
+		Ocr:             fakeOCR{},
+		AppiumServerURL: server.URL,
+		DataDir:         dataDir,
+		Output:          io.Discard,
+		Variables: map[string]string{
+			"device.id":     "2",
+			"device.serial": "device-b",
+		},
+	}
+
+	err := runner.Run(context.Background(), Timeline{{Type: CommandAppium, Action: ActionCapture, Find: `verifica..o[^0-9]+([0-9]{6})`, Output: "verification_code.csv"}})
+
+	require.NoError(t, err)
+	require.Equal(t, "583921", runner.Variables["verification_code"])
+	content, err := os.ReadFile(filepath.Join(dataDir, "verification_code.csv"))
+	require.NoError(t, err)
+	require.Equal(t, "id,device,value\n2,device-b,583921\n", string(content))
+	require.Equal(t, []string{
+		"POST /session",
+		"GET /session/session-1/source",
+		"DELETE /session/session-1",
+	}, requests)
+}
+
+func TestRunnerCapturesAppiumRegexToDynamicCSVWithOutputKey(t *testing.T) {
+	dataDir := t.TempDir()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case "POST /session":
+			_, _ = w.Write([]byte(`{"value":{"sessionId":"session-1","capabilities":{}}}`))
+		case "GET /session/session-1/source":
+			_, _ = w.Write([]byte(`{"value":"<hierarchy><node text='834965'/></hierarchy>"}`))
+		case "DELETE /session/session-1":
+			_, _ = w.Write([]byte(`{"value":null}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	runner := Runner{
+		Device:          &recordingDevice{},
+		Ocr:             fakeOCR{},
+		AppiumServerURL: server.URL,
+		DataDir:         dataDir,
+		Output:          io.Discard,
+		Variables: map[string]string{
+			"device.id":     "1",
+			"device.serial": "device-a",
+			"user.username": "alice",
+		},
+	}
+
+	err := runner.Run(context.Background(), Timeline{{Type: CommandAppium, Action: ActionCapture, Find: `\b([0-9]{6})\b`, Output: "{{user.username}}_code.csv", OutputKey: "verification_code"}})
+
+	require.NoError(t, err)
+	require.Equal(t, "834965", runner.Variables["alice_code"])
+	require.Equal(t, "834965", runner.Variables["verification_code"])
+	content, err := os.ReadFile(filepath.Join(dataDir, "alice_code.csv"))
+	require.NoError(t, err)
+	require.Equal(t, "id,device,value\n1,device-a,834965\n", string(content))
+}
+
+func TestRunnerWaitsForAppiumCapture(t *testing.T) {
+	output := filepath.Join(t.TempDir(), "code.txt")
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case "POST /session":
+			_, _ = w.Write([]byte(`{"value":{"sessionId":"session-1","capabilities":{}}}`))
+		case "GET /session/session-1/source":
+			attempts++
+			if attempts < 3 {
+				_, _ = w.Write([]byte(`{"value":"<hierarchy><node text='Inbox loading'/></hierarchy>"}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"value":"<hierarchy><node text='Verification code: 771204'/></hierarchy>"}`))
+		case "DELETE /session/session-1":
+			_, _ = w.Write([]byte(`{"value":null}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	runner := Runner{Device: &recordingDevice{}, Ocr: fakeOCR{}, AppiumServerURL: server.URL, Output: io.Discard}
+
+	err := runner.Run(context.Background(), Timeline{{Type: CommandAppium, Action: ActionWait, Then: ActionCapture, Find: `code: ([0-9]{6})`, Output: output, Timeout: "200ms", Interval: "1ms"}})
+
+	require.NoError(t, err)
+	require.Equal(t, 3, attempts)
+	content, err := os.ReadFile(output)
+	require.NoError(t, err)
+	require.Equal(t, "771204\n", string(content))
+}
+
 func TestRunnerSerializesAppiumSessionCreation(t *testing.T) {
 	var active atomic.Int32
 	var maxActive atomic.Int32

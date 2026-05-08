@@ -109,6 +109,7 @@ const (
 	tuiOptionSelectAllDevices
 	tuiOptionClearDevices
 	tuiOptionDetectIDs
+	tuiOptionDeviceRunMode
 	tuiOptionStartIndex
 	tuiOptionFallback
 	tuiOptionAppiumShards
@@ -142,6 +143,7 @@ type tuiModel struct {
 	optionIndex              int
 	fallbackScriptIndex      int
 	detectDeviceIDs          bool
+	deviceRunMode            string
 	startIndex               int
 	appiumShards             int
 	appiumSessionConcurrency int
@@ -184,6 +186,7 @@ func newTUIModel(ctx context.Context, cfg commandConfig) tuiModel {
 		cfg:                      cfg,
 		selectedDevices:          make(map[int]bool),
 		fallbackScriptIndex:      -1,
+		deviceRunMode:            normalizedDeviceRunModeForTUI(cfg.deviceRunMode),
 		appiumShards:             cfg.appiumShards,
 		appiumSessionConcurrency: appiumSessionConcurrency(cfg),
 		appiumURLs:               strings.TrimSpace(cfg.appiumURLs),
@@ -532,6 +535,7 @@ func (m tuiModel) optionLabels() []string {
 		"select all devices",
 		"clear device selection",
 		"detect device ids: " + detect,
+		"device run mode: " + m.deviceRunModeLabel(),
 		fmt.Sprintf("start index: %d", m.startIndex),
 		"fallback override: " + m.fallbackLabel(),
 		"appium shards: " + m.appiumShardLabel(),
@@ -541,6 +545,13 @@ func (m tuiModel) optionLabels() []string {
 		"open config folder",
 		"quit",
 	}
+}
+
+func (m tuiModel) deviceRunModeLabel() string {
+	if m.deviceRunMode == deviceRunModeQueue {
+		return deviceRunModeQueue
+	}
+	return deviceRunModeParallel
 }
 
 func (m tuiModel) appiumShardLabel() string {
@@ -614,6 +625,8 @@ func (m *tuiModel) adjustOption(delta int) {
 		}
 	case tuiOptionFallback:
 		m.cycleFallback(delta)
+	case tuiOptionDeviceRunMode:
+		m.toggleDeviceRunMode()
 	case tuiOptionAppiumShards:
 		m.adjustAppiumShards(delta)
 	case tuiOptionAppiumSessionConcurrency:
@@ -673,6 +686,8 @@ func (m *tuiModel) activateOption(option tuiOption) tea.Cmd {
 		m.clearDevices()
 	case tuiOptionDetectIDs:
 		m.detectDeviceIDs = !m.detectDeviceIDs
+	case tuiOptionDeviceRunMode:
+		m.toggleDeviceRunMode()
 	case tuiOptionStartIndex:
 		m.startIndex++
 	case tuiOptionFallback:
@@ -695,6 +710,23 @@ func (m *tuiModel) activateOption(option tuiOption) tea.Cmd {
 		return tea.Quit
 	}
 	return nil
+}
+
+func (m *tuiModel) toggleDeviceRunMode() {
+	if m.deviceRunMode == deviceRunModeQueue {
+		m.deviceRunMode = deviceRunModeParallel
+	} else {
+		m.deviceRunMode = deviceRunModeQueue
+	}
+	m.status = "device run mode set to " + m.deviceRunMode
+}
+
+func normalizedDeviceRunModeForTUI(mode string) string {
+	normalized, err := normalizeDeviceRunMode(mode)
+	if err != nil {
+		return deviceRunModeParallel
+	}
+	return normalized
 }
 
 func (m *tuiModel) adjustAppiumShards(delta int) {
@@ -905,6 +937,7 @@ func (m tuiModel) selectedRunConfig() (commandConfig, error) {
 		cfg.fallbackPath = m.scripts[m.fallbackScriptIndex].Path
 	}
 	cfg.timeLineIndex = m.startIndex
+	cfg.deviceRunMode = m.deviceRunModeLabel()
 	if strings.TrimSpace(m.appiumURLs) != "" {
 		cfg.appiumURLs = strings.TrimSpace(m.appiumURLs)
 		cfg.appiumShards = 0

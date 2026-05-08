@@ -46,6 +46,7 @@ type commandConfig struct {
 	deviceSerial               string
 	deviceSerials              string
 	deviceIDs                  string
+	deviceRunMode              string
 	detectDeviceIDs            bool
 	deviceMapPath              string
 	setupDevices               bool
@@ -86,6 +87,8 @@ const (
 	defaultAppiumMjpegPortBase        = 9200
 	defaultAppiumChromedriverPortBase = 10200
 	defaultDeviceLogDir               = ".tmp/device-logs"
+	deviceRunModeParallel             = "parallel"
+	deviceRunModeQueue                = "queue"
 )
 
 type appiumServerProcess struct {
@@ -142,6 +145,11 @@ func runCommandWithOutput(ctx context.Context, cfg commandConfig, flags *flag.Fl
 	if output == nil {
 		output = io.Discard
 	}
+	deviceRunMode, err := normalizeDeviceRunMode(cfg.deviceRunMode)
+	if err != nil {
+		return err
+	}
+	cfg.deviceRunMode = deviceRunMode
 	if cfg.doctor {
 		return runDoctor(ctx, cfg, output)
 	}
@@ -495,6 +503,7 @@ func parseFlags(cfg *commandConfig, args []string) *flag.FlagSet {
 	flags.StringVar(&cfg.deviceSerial, "serial", "", "ADB device serial to target")
 	flags.StringVar(&cfg.deviceSerials, "serials", "", "Comma-separated ADB device serials to target; order defines device ids")
 	flags.StringVar(&cfg.deviceIDs, "device-ids", "", "Comma-separated 1-based device ids matching selected devices; id 1 uses data row 0")
+	flags.StringVar(&cfg.deviceRunMode, "device-run-mode", deviceRunModeParallel, "How multiple devices run: parallel or queue")
 	flags.BoolVar(&cfg.detectDeviceIDs, "detect-device-ids", false, "Detect each 1-based device id from the wallpaper/background number using OCR")
 	flags.StringVar(&cfg.deviceMapPath, "device-map", configPaths.DeviceMapPath, "Path to read/save the device id to ADB serial map")
 	flags.BoolVar(&cfg.setupDevices, "setup-devices", false, "Detect device ids from wallpaper/background OCR, save -device-map, and exit")
@@ -1520,9 +1529,25 @@ func appiumServerURLs(cfg commandConfig, targetCount int) ([]string, error) {
 	}
 	shards := cfg.appiumShards
 	if shards <= 0 {
-		shards = autoAppiumShardCount(targetCount)
+		if cfg.deviceRunMode == deviceRunModeQueue {
+			shards = 1
+		} else {
+			shards = autoAppiumShardCount(targetCount)
+		}
 	}
 	return appiumShardURLs(serverURL, shards)
+}
+
+func normalizeDeviceRunMode(mode string) (string, error) {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	switch mode {
+	case "", deviceRunModeParallel:
+		return deviceRunModeParallel, nil
+	case deviceRunModeQueue, "serial", "sequential":
+		return deviceRunModeQueue, nil
+	default:
+		return "", fmt.Errorf("device run mode must be %q or %q, got %q", deviceRunModeParallel, deviceRunModeQueue, mode)
+	}
 }
 
 func parseAppiumURLList(raw string) ([]string, error) {
@@ -1769,6 +1794,9 @@ func runTimelineOnDevices(ctx context.Context, cfg commandConfig, timeline auto.
 	if len(targets) == 1 {
 		return runTimelineOnDeviceWithFallback(ctx, cfg, timeline, fallbackTimeline, dataSet, targets[0], writer)
 	}
+	if cfg.deviceRunMode == deviceRunModeQueue {
+		return runTimelineOnDevicesQueued(ctx, cfg, timeline, fallbackTimeline, dataSet, targets, writer)
+	}
 
 	errors := make(chan error, len(targets))
 	var wg sync.WaitGroup
@@ -1792,6 +1820,19 @@ func runTimelineOnDevices(ctx context.Context, cfg commandConfig, timeline auto.
 		return fmt.Errorf("%d device(s) failed:\n%s", len(messages), strings.Join(messages, "\n"))
 	}
 
+	return nil
+}
+
+func runTimelineOnDevicesQueued(ctx context.Context, cfg commandConfig, timeline auto.Timeline, fallbackTimeline auto.Timeline, dataSet *auto.DataSet, targets []deviceTarget, output io.Writer) error {
+	messages := make([]string, 0)
+	for _, target := range targets {
+		if err := runTimelineOnDeviceWithFallback(ctx, cfg, timeline, fallbackTimeline, dataSet, target, output); err != nil {
+			messages = append(messages, err.Error())
+		}
+	}
+	if len(messages) > 0 {
+		return fmt.Errorf("%d device(s) failed:\n%s", len(messages), strings.Join(messages, "\n"))
+	}
 	return nil
 }
 
