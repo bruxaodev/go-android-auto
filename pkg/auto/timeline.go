@@ -37,15 +37,19 @@ type Device interface {
 }
 
 type Runner struct {
-	Device          Device
-	Ocr             ocr.Engine
-	Appium          *appium.Client
-	AppiumSession   *appium.Session
-	AppiumServerURL string
-	BootTimeout     time.Duration
-	DataDir         string
-	Output          io.Writer
-	Variables       map[string]string
+	Device                     Device
+	Ocr                        ocr.Engine
+	Appium                     *appium.Client
+	AppiumSession              *appium.Session
+	AppiumServerURL            string
+	AppiumSessionLimiter       chan struct{}
+	AppiumSystemPortBase       int
+	AppiumMjpegPortBase        int
+	AppiumChromedriverPortBase int
+	BootTimeout                time.Duration
+	DataDir                    string
+	Output                     io.Writer
+	Variables                  map[string]string
 }
 
 var variablePattern = regexp.MustCompile(`\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}`)
@@ -55,6 +59,9 @@ const (
 	defaultWaitInterval         = time.Second
 	defaultAppiumSessionTimeout = 2 * time.Minute
 	defaultAppiumTimeoutMS      = 120000
+	defaultAppiumSystemPortBase = 8200
+	defaultAppiumMjpegPortBase  = 9200
+	defaultAppiumChromePortBase = 10200
 )
 
 var (
@@ -1206,10 +1213,11 @@ func (r *Runner) ensureAppiumSession(ctx context.Context, c Command) (*appium.Se
 	capabilities := r.defaultAppiumCapabilities()
 	maps.Copy(capabilities, c.Capabilities)
 	logAppiumSessionStart(r.Output, client.ServerURL, capabilities)
-	if err := acquireAppiumSessionCreationSlot(ctx); err != nil {
+	creationSlots := r.appiumSessionCreationSlots()
+	if err := acquireAppiumSessionCreationSlot(ctx, creationSlots); err != nil {
 		return nil, err
 	}
-	defer func() { <-appiumSessionCreationSlots }()
+	defer func() { <-creationSlots }()
 	sessionCtx, cancel := context.WithTimeout(ctx, defaultAppiumSessionTimeout)
 	defer cancel()
 	session, err := client.CreateSession(sessionCtx, capabilities)
@@ -1220,9 +1228,16 @@ func (r *Runner) ensureAppiumSession(ctx context.Context, c Command) (*appium.Se
 	return session, nil
 }
 
-func acquireAppiumSessionCreationSlot(ctx context.Context) error {
+func (r *Runner) appiumSessionCreationSlots() chan struct{} {
+	if r.AppiumSessionLimiter != nil {
+		return r.AppiumSessionLimiter
+	}
+	return appiumSessionCreationSlots
+}
+
+func acquireAppiumSessionCreationSlot(ctx context.Context, slots chan struct{}) error {
 	select {
-	case appiumSessionCreationSlots <- struct{}{}:
+	case slots <- struct{}{}:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -1234,7 +1249,7 @@ func logAppiumSessionStart(output io.Writer, serverURL string, capabilities map[
 		output = os.Stdout
 	}
 	parts := []string{"[appium] creating session", "server " + safeAppiumServerURL(serverURL)}
-	for _, key := range []string{"appium:udid", "appium:systemPort", "appium:mjpegServerPort"} {
+	for _, key := range []string{"appium:udid", "appium:systemPort", "appium:mjpegServerPort", "appium:chromedriverPort"} {
 		if value, ok := capabilities[key]; ok {
 			parts = append(parts, strings.TrimPrefix(key, "appium:")+" "+fmt.Sprint(value))
 		}
@@ -1268,11 +1283,23 @@ func (r *Runner) defaultAppiumCapabilities() map[string]any {
 		capabilities["appium:deviceName"] = serial
 		capabilities["appium:udid"] = serial
 	}
-	if index, err := strconv.Atoi(r.Variables["device.index"]); err == nil && index >= 0 {
-		capabilities["appium:systemPort"] = 8200 + index
-		capabilities["appium:mjpegServerPort"] = 9200 + index
+	portIndexText := r.Variables["device.port_index"]
+	if portIndexText == "" {
+		portIndexText = r.Variables["device.index"]
+	}
+	if index, err := strconv.Atoi(portIndexText); err == nil && index >= 0 {
+		capabilities["appium:systemPort"] = appiumPort(r.AppiumSystemPortBase, defaultAppiumSystemPortBase, index)
+		capabilities["appium:mjpegServerPort"] = appiumPort(r.AppiumMjpegPortBase, defaultAppiumMjpegPortBase, index)
+		capabilities["appium:chromedriverPort"] = appiumPort(r.AppiumChromedriverPortBase, defaultAppiumChromePortBase, index)
 	}
 	return capabilities
+}
+
+func appiumPort(base int, fallback int, index int) int {
+	if base <= 0 {
+		base = fallback
+	}
+	return base + index
 }
 
 func (r *Runner) Close(ctx context.Context) error {

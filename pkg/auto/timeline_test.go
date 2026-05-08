@@ -278,6 +278,7 @@ func TestRunnerInterleavesADBAndAppiumActions(t *testing.T) {
 			require.Equal(t, "device-a", body.Capabilities.AlwaysMatch["appium:udid"])
 			require.Equal(t, float64(8201), body.Capabilities.AlwaysMatch["appium:systemPort"])
 			require.Equal(t, float64(9201), body.Capabilities.AlwaysMatch["appium:mjpegServerPort"])
+			require.Equal(t, float64(10201), body.Capabilities.AlwaysMatch["appium:chromedriverPort"])
 			require.Equal(t, float64(120000), body.Capabilities.AlwaysMatch["appium:adbExecTimeout"])
 			require.Equal(t, float64(120000), body.Capabilities.AlwaysMatch["appium:androidInstallTimeout"])
 			require.Equal(t, float64(120000), body.Capabilities.AlwaysMatch["appium:uiautomator2ServerInstallTimeout"])
@@ -750,6 +751,98 @@ func TestRunnerSerializesAppiumSessionCreation(t *testing.T) {
 	}
 	require.Equal(t, int32(1), maxActive.Load())
 	require.Equal(t, int32(2), sessions.Load())
+}
+
+func TestRunnerUsesConfiguredAppiumSessionLimiter(t *testing.T) {
+	var active atomic.Int32
+	var maxActive atomic.Int32
+	var sessions atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/session":
+			current := active.Add(1)
+			for {
+				max := maxActive.Load()
+				if current <= max || maxActive.CompareAndSwap(max, current) {
+					break
+				}
+			}
+			time.Sleep(30 * time.Millisecond)
+			id := sessions.Add(1)
+			active.Add(-1)
+			_, _ = w.Write([]byte(`{"value":{"sessionId":"session-` + strconv.Itoa(int(id)) + `","capabilities":{}}}`))
+		case r.Method == http.MethodDelete:
+			_, _ = w.Write([]byte(`{"value":null}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	limiter := make(chan struct{}, 2)
+	errs := make(chan error, 3)
+	var wg sync.WaitGroup
+	for _, variables := range []map[string]string{
+		{"device.port_index": "0", "device.serial": "device-a"},
+		{"device.port_index": "1", "device.serial": "device-b"},
+		{"device.port_index": "2", "device.serial": "device-c"},
+	} {
+		variables := variables
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			runner := Runner{Device: &recordingDevice{}, Ocr: fakeOCR{}, AppiumServerURL: server.URL, AppiumSessionLimiter: limiter, Output: io.Discard, Variables: variables}
+			errs <- runner.Run(context.Background(), Timeline{{Type: CommandAppium, Action: ActionStartSession}})
+		}()
+	}
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		require.NoError(t, err)
+	}
+	require.Equal(t, int32(2), maxActive.Load())
+	require.Equal(t, int32(3), sessions.Load())
+}
+
+func TestRunnerUsesPortIndexAndConfiguredPortBases(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case "POST /session":
+			var body struct {
+				Capabilities struct {
+					AlwaysMatch map[string]any `json:"alwaysMatch"`
+				} `json:"capabilities"`
+			}
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+			require.Equal(t, float64(13005), body.Capabilities.AlwaysMatch["appium:systemPort"])
+			require.Equal(t, float64(14005), body.Capabilities.AlwaysMatch["appium:mjpegServerPort"])
+			require.Equal(t, float64(15005), body.Capabilities.AlwaysMatch["appium:chromedriverPort"])
+			_, _ = w.Write([]byte(`{"value":{"sessionId":"session-1","capabilities":{}}}`))
+		case "DELETE /session/session-1":
+			_, _ = w.Write([]byte(`{"value":null}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	runner := Runner{
+		Device:                     &recordingDevice{},
+		Ocr:                        fakeOCR{},
+		AppiumServerURL:            server.URL,
+		AppiumSystemPortBase:       13000,
+		AppiumMjpegPortBase:        14000,
+		AppiumChromedriverPortBase: 15000,
+		Output:                     io.Discard,
+		Variables:                  map[string]string{"device.index": "1", "device.port_index": "5", "device.serial": "device-a"},
+	}
+
+	err := runner.Run(context.Background(), Timeline{{Type: CommandAppium, Action: ActionStartSession}})
+
+	require.NoError(t, err)
 }
 
 func TestAddGoogleAccountAppiumTimelineAttachesToCurrentScreen(t *testing.T) {

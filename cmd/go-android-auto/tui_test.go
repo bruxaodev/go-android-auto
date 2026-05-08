@@ -42,12 +42,14 @@ func TestSelectedRunConfigUsesSelectedScriptDevicesAndOptions(t *testing.T) {
 			{Name: "first.yaml", Path: "/config/automation/first.yaml"},
 			{Name: "fallback.yaml", Path: "/config/automation/fallback.yaml"},
 		},
-		devices:             []tuiDevice{{ID: 2, Serial: "device-b", Name: "Beta"}, {ID: 1, Serial: "device-a", Name: "Alpha"}},
-		selectedDevices:     map[int]bool{0: true, 1: true},
-		scriptIndex:         0,
-		fallbackScriptIndex: 1,
-		detectDeviceIDs:     true,
-		startIndex:          3,
+		devices:                  []tuiDevice{{ID: 2, Serial: "device-b", Name: "Beta"}, {ID: 1, Serial: "device-a", Name: "Alpha"}},
+		selectedDevices:          map[int]bool{0: true, 1: true},
+		scriptIndex:              0,
+		fallbackScriptIndex:      1,
+		detectDeviceIDs:          true,
+		startIndex:               3,
+		appiumShards:             4,
+		appiumSessionConcurrency: 8,
 	}
 
 	cfg, err := m.selectedRunConfig()
@@ -58,7 +60,72 @@ func TestSelectedRunConfigUsesSelectedScriptDevicesAndOptions(t *testing.T) {
 	require.Equal(t, "device-a,device-b", cfg.deviceSerials)
 	require.True(t, cfg.detectDeviceIDs)
 	require.Equal(t, 3, cfg.timeLineIndex)
+	require.Equal(t, 4, cfg.appiumShards)
+	require.Equal(t, 8, cfg.appiumSessionConcurrency)
 	require.Equal(t, "/config/values", cfg.dataDir)
+}
+
+func TestSelectedRunConfigUsesTUIAppiumURLs(t *testing.T) {
+	m := tuiModel{
+		cfg: commandConfig{
+			automationDir: "/config/automation",
+			dataDir:       "/config/values",
+			deviceMapPath: "/config/device-map.json",
+		},
+		scripts:                  []tuiScript{{Name: "first.yaml", Path: "/config/automation/first.yaml"}},
+		devices:                  []tuiDevice{{ID: 1, Serial: "device-a", Name: "Alpha"}},
+		selectedDevices:          map[int]bool{0: true},
+		appiumShards:             10,
+		appiumSessionConcurrency: 6,
+		appiumURLs:               "http://127.0.0.1:4723,http://127.0.0.1:4724",
+	}
+
+	cfg, err := m.selectedRunConfig()
+
+	require.NoError(t, err)
+	require.Equal(t, "http://127.0.0.1:4723,http://127.0.0.1:4724", cfg.appiumURLs)
+	require.Zero(t, cfg.appiumShards)
+	require.Equal(t, 6, cfg.appiumSessionConcurrency)
+}
+
+func TestTUIViewShowsAppiumOptions(t *testing.T) {
+	m := tuiModel{
+		cfg:                      commandConfig{deviceMapPath: filepath.Join(t.TempDir(), "device-map.json")},
+		scripts:                  []tuiScript{{Name: "first.yaml", Path: "first.yaml"}},
+		devices:                  []tuiDevice{{ID: 1, Serial: "device-a", Name: "Alpha"}},
+		selectedDevices:          map[int]bool{0: true},
+		appiumShards:             10,
+		appiumSessionConcurrency: 5,
+	}
+
+	view := stripANSI(m.View())
+
+	require.Contains(t, view, "appium shards: 10")
+	require.Contains(t, view, "appium sessions: 5")
+	require.Contains(t, view, "appium urls: auto")
+}
+
+func TestTUIEditsAppiumURLs(t *testing.T) {
+	m := tuiModel{}
+	m.startEditingAppiumURLs()
+	m.appiumURLEditText = " http://127.0.0.1:4723,http://127.0.0.1:4724 "
+
+	model, cmd := m.updateAppiumURLEdit(tea.KeyMsg{Type: tea.KeyEnter})
+	updated := model.(tuiModel)
+
+	require.Nil(t, cmd)
+	require.False(t, updated.editingAppiumURLs)
+	require.Equal(t, "http://127.0.0.1:4723,http://127.0.0.1:4724", updated.appiumURLs)
+	require.Equal(t, "appium urls updated", updated.status)
+}
+
+func TestTUIAdjustAppiumShardsClearsURLs(t *testing.T) {
+	m := tuiModel{appiumURLs: "http://127.0.0.1:4723", appiumShards: 0}
+
+	m.adjustAppiumShards(1)
+
+	require.Empty(t, m.appiumURLs)
+	require.Equal(t, 1, m.appiumShards)
 }
 
 func TestTUIViewHighlightsSelectedScript(t *testing.T) {

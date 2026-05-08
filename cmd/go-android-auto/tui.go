@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -110,6 +111,9 @@ const (
 	tuiOptionDetectIDs
 	tuiOptionStartIndex
 	tuiOptionFallback
+	tuiOptionAppiumShards
+	tuiOptionAppiumSessionConcurrency
+	tuiOptionAppiumURLs
 	tuiOptionRefresh
 	tuiOptionOpenConfig
 	tuiOptionQuit
@@ -127,25 +131,30 @@ type tuiDevice struct {
 }
 
 type tuiModel struct {
-	ctx                 context.Context
-	cfg                 commandConfig
-	scripts             []tuiScript
-	devices             []tuiDevice
-	selectedDevices     map[int]bool
-	section             tuiSection
-	scriptIndex         int
-	deviceIndex         int
-	optionIndex         int
-	fallbackScriptIndex int
-	detectDeviceIDs     bool
-	startIndex          int
-	status              string
-	action              tuiAction
-	running             bool
-	logs                []string
-	logChan             <-chan tea.Msg
-	width               int
-	height              int
+	ctx                      context.Context
+	cfg                      commandConfig
+	scripts                  []tuiScript
+	devices                  []tuiDevice
+	selectedDevices          map[int]bool
+	section                  tuiSection
+	scriptIndex              int
+	deviceIndex              int
+	optionIndex              int
+	fallbackScriptIndex      int
+	detectDeviceIDs          bool
+	startIndex               int
+	appiumShards             int
+	appiumSessionConcurrency int
+	appiumURLs               string
+	editingAppiumURLs        bool
+	appiumURLEditText        string
+	status                   string
+	action                   tuiAction
+	running                  bool
+	logs                     []string
+	logChan                  <-chan tea.Msg
+	width                    int
+	height                   int
 }
 
 type tuiRunLogMsg string
@@ -171,11 +180,14 @@ func runTUI(ctx context.Context) error {
 
 func newTUIModel(ctx context.Context, cfg commandConfig) tuiModel {
 	m := tuiModel{
-		ctx:                 ctx,
-		cfg:                 cfg,
-		selectedDevices:     make(map[int]bool),
-		fallbackScriptIndex: -1,
-		logs:                []string{"Output will appear here after you run a script."},
+		ctx:                      ctx,
+		cfg:                      cfg,
+		selectedDevices:          make(map[int]bool),
+		fallbackScriptIndex:      -1,
+		appiumShards:             cfg.appiumShards,
+		appiumSessionConcurrency: appiumSessionConcurrency(cfg),
+		appiumURLs:               strings.TrimSpace(cfg.appiumURLs),
+		logs:                     []string{"Output will appear here after you run a script."},
 	}
 	m.reload()
 	return m
@@ -206,6 +218,9 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		return m, nil
 	case tea.KeyMsg:
+		if m.editingAppiumURLs {
+			return m.updateAppiumURLEdit(msg)
+		}
 		switch msg.String() {
 		case "ctrl+c", "esc", "q":
 			return m, tea.Quit
@@ -340,6 +355,9 @@ func (m tuiModel) renderOutputPanel(width int, height int) string {
 }
 
 func (m tuiModel) renderFooter(width int) string {
+	if m.editingAppiumURLs {
+		return tuiFooterStyle.Width(width).Render(trimLogLine("editing appium urls | type URLs separated by comma | enter save | esc cancel", width-2))
+	}
 	keys := "tab sections | up/down move | left/right adjust | space select | a all | x none | enter action | q quit"
 	if width < 88 {
 		keys = "tab sections | arrows move/adjust | space select | enter action | q quit"
@@ -516,10 +534,43 @@ func (m tuiModel) optionLabels() []string {
 		"detect device ids: " + detect,
 		fmt.Sprintf("start index: %d", m.startIndex),
 		"fallback override: " + m.fallbackLabel(),
+		"appium shards: " + m.appiumShardLabel(),
+		fmt.Sprintf("appium sessions: %d", m.normalizedAppiumSessionConcurrency()),
+		"appium urls: " + m.appiumURLLabel(),
 		"refresh scripts/devices",
 		"open config folder",
 		"quit",
 	}
+}
+
+func (m tuiModel) appiumShardLabel() string {
+	if strings.TrimSpace(m.appiumURLs) != "" {
+		return "urls"
+	}
+	if m.appiumShards <= 0 {
+		return "auto"
+	}
+	return strconv.Itoa(m.appiumShards)
+}
+
+func (m tuiModel) normalizedAppiumSessionConcurrency() int {
+	if m.appiumSessionConcurrency <= 0 {
+		return defaultAppiumSessionConcurrency
+	}
+	return m.appiumSessionConcurrency
+}
+
+func (m tuiModel) appiumURLLabel() string {
+	if m.editingAppiumURLs {
+		if strings.TrimSpace(m.appiumURLEditText) == "" {
+			return "auto|"
+		}
+		return m.appiumURLEditText + "|"
+	}
+	if strings.TrimSpace(m.appiumURLs) == "" {
+		return "auto"
+	}
+	return m.appiumURLs
 }
 
 func (m tuiModel) fallbackLabel() string {
@@ -563,6 +614,10 @@ func (m *tuiModel) adjustOption(delta int) {
 		}
 	case tuiOptionFallback:
 		m.cycleFallback(delta)
+	case tuiOptionAppiumShards:
+		m.adjustAppiumShards(delta)
+	case tuiOptionAppiumSessionConcurrency:
+		m.adjustAppiumSessionConcurrency(delta)
 	}
 }
 
@@ -622,6 +677,12 @@ func (m *tuiModel) activateOption(option tuiOption) tea.Cmd {
 		m.startIndex++
 	case tuiOptionFallback:
 		m.cycleFallback(1)
+	case tuiOptionAppiumShards:
+		m.adjustAppiumShards(1)
+	case tuiOptionAppiumSessionConcurrency:
+		m.adjustAppiumSessionConcurrency(1)
+	case tuiOptionAppiumURLs:
+		m.startEditingAppiumURLs()
 	case tuiOptionRefresh:
 		m.reload()
 	case tuiOptionOpenConfig:
@@ -634,6 +695,67 @@ func (m *tuiModel) activateOption(option tuiOption) tea.Cmd {
 		return tea.Quit
 	}
 	return nil
+}
+
+func (m *tuiModel) adjustAppiumShards(delta int) {
+	if strings.TrimSpace(m.appiumURLs) != "" {
+		m.appiumURLs = ""
+	}
+	m.appiumShards += delta
+	if m.appiumShards < 0 {
+		m.appiumShards = 0
+	}
+	if m.appiumShards == 0 {
+		m.status = "appium shards set to auto"
+		return
+	}
+	m.status = fmt.Sprintf("appium shards set to %d", m.appiumShards)
+}
+
+func (m *tuiModel) adjustAppiumSessionConcurrency(delta int) {
+	m.appiumSessionConcurrency += delta
+	if m.appiumSessionConcurrency < 1 {
+		m.appiumSessionConcurrency = 1
+	}
+	m.status = fmt.Sprintf("appium session concurrency set to %d", m.appiumSessionConcurrency)
+}
+
+func (m *tuiModel) startEditingAppiumURLs() {
+	m.editingAppiumURLs = true
+	m.appiumURLEditText = strings.TrimSpace(m.appiumURLs)
+	m.status = "editing appium urls"
+}
+
+func (m tuiModel) updateAppiumURLEdit(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+	case "esc":
+		m.editingAppiumURLs = false
+		m.appiumURLEditText = ""
+		m.status = "appium urls edit cancelled"
+		return m, nil
+	case "enter":
+		m.appiumURLs = strings.TrimSpace(m.appiumURLEditText)
+		m.editingAppiumURLs = false
+		m.appiumURLEditText = ""
+		if m.appiumURLs == "" {
+			m.status = "appium urls set to auto"
+		} else {
+			m.status = "appium urls updated"
+		}
+		return m, nil
+	case "backspace", "ctrl+h":
+		runes := []rune(m.appiumURLEditText)
+		if len(runes) > 0 {
+			m.appiumURLEditText = string(runes[:len(runes)-1])
+		}
+		return m, nil
+	}
+	if len(msg.Runes) > 0 {
+		m.appiumURLEditText += string(msg.Runes)
+	}
+	return m, nil
 }
 
 func (m *tuiModel) startCommand(label string, run func(context.Context, io.Writer) error) tea.Cmd {
@@ -783,6 +905,14 @@ func (m tuiModel) selectedRunConfig() (commandConfig, error) {
 		cfg.fallbackPath = m.scripts[m.fallbackScriptIndex].Path
 	}
 	cfg.timeLineIndex = m.startIndex
+	if strings.TrimSpace(m.appiumURLs) != "" {
+		cfg.appiumURLs = strings.TrimSpace(m.appiumURLs)
+		cfg.appiumShards = 0
+	} else {
+		cfg.appiumURLs = ""
+		cfg.appiumShards = m.appiumShards
+	}
+	cfg.appiumSessionConcurrency = m.normalizedAppiumSessionConcurrency()
 	return cfg, nil
 }
 

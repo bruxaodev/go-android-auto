@@ -13,6 +13,7 @@ import (
 	"io/fs"
 	"log"
 	"maps"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -37,23 +38,31 @@ type configFS interface {
 }
 
 type commandConfig struct {
-	timeLinePath    string
-	fallbackPath    string
-	timeLineIndex   int
-	automationDir   string
-	adbPath         string
-	deviceSerial    string
-	deviceSerials   string
-	deviceIDs       string
-	detectDeviceIDs bool
-	deviceMapPath   string
-	setupDevices    bool
-	allDevices      bool
-	tesseractPath   string
-	appiumCommand   string
-	appiumURL       string
-	dataDir         string
-	doctor          bool
+	timeLinePath               string
+	fallbackPath               string
+	timeLineIndex              int
+	automationDir              string
+	adbPath                    string
+	deviceSerial               string
+	deviceSerials              string
+	deviceIDs                  string
+	detectDeviceIDs            bool
+	deviceMapPath              string
+	setupDevices               bool
+	allDevices                 bool
+	tesseractPath              string
+	appiumCommand              string
+	appiumURL                  string
+	appiumURLs                 string
+	appiumShards               int
+	appiumSessionConcurrency   int
+	appiumSessionLimiter       chan struct{}
+	appiumSystemPortBase       int
+	appiumMjpegPortBase        int
+	appiumChromedriverPortBase int
+	deviceLogDir               string
+	dataDir                    string
+	doctor                     bool
 }
 
 const (
@@ -69,15 +78,32 @@ type appConfigPaths struct {
 	DeviceMapPath string
 }
 
+const (
+	defaultAppiumURL                  = "http://127.0.0.1:4723"
+	defaultAppiumDevicesPerShard      = 10
+	defaultAppiumSessionConcurrency   = 5
+	defaultAppiumSystemPortBase       = 8200
+	defaultAppiumMjpegPortBase        = 9200
+	defaultAppiumChromedriverPortBase = 10200
+	defaultDeviceLogDir               = ".tmp/device-logs"
+)
+
 type appiumServerProcess struct {
 	Command *exec.Cmd
 	Done    chan error
 	URL     string
 }
 
+type appiumServerPool struct {
+	Servers []*appiumServerProcess
+	URLs    []string
+}
+
 type deviceTarget struct {
 	Serial    string
 	DataIndex int
+	PortIndex int
+	AppiumURL string
 }
 
 type detectedDevice struct {
@@ -162,15 +188,19 @@ func runCommandWithOutput(ctx context.Context, cfg commandConfig, flags *flag.Fl
 
 	appiumTimeline := append(auto.Timeline(nil), timeline...)
 	appiumTimeline = append(appiumTimeline, fallbackTimeline...)
-	appiumServer, err := ensureAppiumServer(ctx, cfg, appiumTimeline, output)
+	targets = assignAppiumTargets(targets, nil)
+	if timelineUsesAppium(appiumTimeline) {
+		cfg.appiumSessionLimiter = make(chan struct{}, appiumSessionConcurrency(cfg))
+	}
+	appiumPool, err := ensureAppiumServerPool(ctx, cfg, appiumTimeline, len(targets), output)
 	if err != nil {
 		return fmt.Errorf("Error starting Appium server: %w", err)
 	}
-	if appiumServer != nil {
-		cfg.appiumURL = appiumServer.URL
+	if appiumPool != nil {
+		targets = assignAppiumTargets(targets, appiumPool.URLs)
 		defer func() {
-			if err := appiumServer.Close(); err != nil {
-				fmt.Fprintf(output, "Error stopping Appium server: %v\n", err)
+			if err := appiumPool.Close(); err != nil {
+				fmt.Fprintf(output, "Error stopping Appium server(s): %v\n", err)
 			}
 		}()
 	}
@@ -472,6 +502,13 @@ func parseFlags(cfg *commandConfig, args []string) *flag.FlagSet {
 	flags.StringVar(&cfg.tesseractPath, "tesseract", "", "Path to the tesseract binary")
 	flags.StringVar(&cfg.appiumCommand, "appium", "appium", "Path to the Appium executable used when appium timeline actions are present")
 	flags.StringVar(&cfg.appiumURL, "appium-url", "", "Appium server URL used by appium timeline actions")
+	flags.StringVar(&cfg.appiumURLs, "appium-urls", "", "Comma-separated Appium server URLs used as shards for multi-device runs")
+	flags.IntVar(&cfg.appiumShards, "appium-shards", 0, "Number of Appium server shards to use/start; 0 auto-sizes by device count")
+	flags.IntVar(&cfg.appiumSessionConcurrency, "appium-session-concurrency", defaultAppiumSessionConcurrency, "Maximum concurrent Appium session creations")
+	flags.IntVar(&cfg.appiumSystemPortBase, "appium-system-port-base", defaultAppiumSystemPortBase, "Base appium:systemPort assigned as base + device port index")
+	flags.IntVar(&cfg.appiumMjpegPortBase, "appium-mjpeg-port-base", defaultAppiumMjpegPortBase, "Base appium:mjpegServerPort assigned as base + device port index")
+	flags.IntVar(&cfg.appiumChromedriverPortBase, "appium-chromedriver-port-base", defaultAppiumChromedriverPortBase, "Base appium:chromedriverPort assigned as base + device port index")
+	flags.StringVar(&cfg.deviceLogDir, "device-log-dir", defaultDeviceLogDir, "Directory for per-device log files during multi-device runs; empty disables files")
 	flags.StringVar(&cfg.dataDir, "values", configPaths.DataDir, "Directory with CSV data files used by {{file.column}} timeline variables")
 	flags.BoolVar(&cfg.doctor, "doctor", false, "Check config, dependencies, devices, and selected timeline readiness")
 	if err := flags.Parse(args); err != nil {
@@ -704,10 +741,29 @@ func resolveDeviceTargets(ctx context.Context, cfg commandConfig, output ...io.W
 
 	targets := make([]deviceTarget, len(serials))
 	for i, serial := range serials {
-		targets[i] = deviceTarget{Serial: serial, DataIndex: dataIndexes[i]}
+		targets[i] = deviceTarget{Serial: serial, DataIndex: dataIndexes[i], PortIndex: i}
 	}
 
 	return targets, nil
+}
+
+func assignAppiumTargets(targets []deviceTarget, appiumURLs []string) []deviceTarget {
+	assigned := make([]deviceTarget, len(targets))
+	copy(assigned, targets)
+	for i := range assigned {
+		assigned[i].PortIndex = i
+		if len(appiumURLs) > 0 {
+			assigned[i].AppiumURL = appiumURLs[i%len(appiumURLs)]
+		}
+	}
+	return assigned
+}
+
+func appiumSessionConcurrency(cfg commandConfig) int {
+	if cfg.appiumSessionConcurrency <= 0 {
+		return defaultAppiumSessionConcurrency
+	}
+	return cfg.appiumSessionConcurrency
 }
 
 func resolveDeviceSerials(ctx context.Context, cfg commandConfig) ([]string, error) {
@@ -1412,16 +1468,123 @@ func saveDeviceMap(path string, devices []detectedDevice) error {
 }
 
 func ensureAppiumServer(ctx context.Context, cfg commandConfig, timeline auto.Timeline, output ...io.Writer) (*appiumServerProcess, error) {
+	pool, err := ensureAppiumServerPool(ctx, cfg, timeline, 1, output...)
+	if err != nil || pool == nil || len(pool.Servers) == 0 {
+		return nil, err
+	}
+	return pool.Servers[0], nil
+}
+
+func ensureAppiumServerPool(ctx context.Context, cfg commandConfig, timeline auto.Timeline, targetCount int, output ...io.Writer) (*appiumServerPool, error) {
 	writer := outputWriter(output...)
 	if !timelineUsesAppium(timeline) {
 		return nil, nil
 	}
+	urls, err := appiumServerURLs(cfg, targetCount)
+	if err != nil {
+		return nil, err
+	}
+	if len(urls) == 0 {
+		return nil, fmt.Errorf("no Appium server URLs resolved")
+	}
+
+	pool := &appiumServerPool{
+		Servers: make([]*appiumServerProcess, 0, len(urls)),
+		URLs:    urls,
+	}
+	for _, serverURL := range urls {
+		process, err := ensureAppiumServerAtURL(ctx, cfg, serverURL, writer)
+		if err != nil {
+			_ = pool.Close()
+			return nil, err
+		}
+		pool.Servers = append(pool.Servers, process)
+	}
+	if len(urls) > 1 {
+		fmt.Fprintf(writer, "Using %d Appium server shard(s): %s\n", len(urls), strings.Join(urls, ", "))
+	}
+	return pool, nil
+}
+
+func appiumServerURLs(cfg commandConfig, targetCount int) ([]string, error) {
+	if strings.TrimSpace(cfg.appiumURLs) != "" {
+		if strings.TrimSpace(cfg.appiumURL) != "" || cfg.appiumShards > 0 {
+			return nil, fmt.Errorf("use only one of -appium-urls, -appium-url, or -appium-shards")
+		}
+		return parseAppiumURLList(cfg.appiumURLs)
+	}
 
 	serverURL := strings.TrimSpace(cfg.appiumURL)
 	if serverURL == "" {
-		serverURL = "http://127.0.0.1:4723"
+		serverURL = defaultAppiumURL
 	}
+	shards := cfg.appiumShards
+	if shards <= 0 {
+		shards = autoAppiumShardCount(targetCount)
+	}
+	return appiumShardURLs(serverURL, shards)
+}
 
+func parseAppiumURLList(raw string) ([]string, error) {
+	parts := strings.Split(raw, ",")
+	urls := make([]string, 0, len(parts))
+	for _, part := range parts {
+		serverURL := strings.TrimSpace(part)
+		if serverURL == "" {
+			continue
+		}
+		urls = append(urls, strings.TrimRight(serverURL, "/"))
+	}
+	if len(urls) == 0 {
+		return nil, fmt.Errorf("-appium-urls did not contain any URL")
+	}
+	return urls, nil
+}
+
+func autoAppiumShardCount(targetCount int) int {
+	if targetCount <= 1 {
+		return 1
+	}
+	return (targetCount + defaultAppiumDevicesPerShard - 1) / defaultAppiumDevicesPerShard
+}
+
+func appiumShardURLs(baseURL string, count int) ([]string, error) {
+	if count <= 0 {
+		return nil, fmt.Errorf("Appium shard count must be greater than 0")
+	}
+	parsedURL, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil {
+		return nil, fmt.Errorf("parse Appium URL %q: %w", baseURL, err)
+	}
+	if parsedURL.Scheme != "http" && parsedURL.Scheme != "https" {
+		return nil, fmt.Errorf("Appium URL must use http or https, got %q", parsedURL.Scheme)
+	}
+	host := parsedURL.Hostname()
+	if host == "" {
+		return nil, fmt.Errorf("Appium URL %q is missing host", baseURL)
+	}
+	port := parsedURL.Port()
+	if port == "" {
+		if parsedURL.Scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	basePort, err := strconv.Atoi(port)
+	if err != nil {
+		return nil, fmt.Errorf("Appium URL %q has invalid port %q", baseURL, port)
+	}
+	urls := make([]string, count)
+	for i := range urls {
+		shardURL := *parsedURL
+		shardURL.Host = net.JoinHostPort(host, strconv.Itoa(basePort+i))
+		urls[i] = strings.TrimRight(shardURL.String(), "/")
+	}
+	return urls, nil
+}
+
+func ensureAppiumServerAtURL(ctx context.Context, cfg commandConfig, serverURL string, writer io.Writer) (*appiumServerProcess, error) {
 	if appiumStatusOK(ctx, serverURL) {
 		fmt.Fprintf(writer, "Using existing Appium server at %s\n", serverURL)
 		return &appiumServerProcess{URL: serverURL}, nil
@@ -1458,6 +1621,22 @@ func ensureAppiumServer(ctx context.Context, cfg commandConfig, timeline auto.Ti
 	}
 	fmt.Fprintf(writer, "Started Appium server at %s\n", serverURL)
 	return process, nil
+}
+
+func (p *appiumServerPool) Close() error {
+	if p == nil {
+		return nil
+	}
+	errors := make([]string, 0)
+	for _, server := range p.Servers {
+		if err := server.Close(); err != nil {
+			errors = append(errors, err.Error())
+		}
+	}
+	if len(errors) > 0 {
+		return fmt.Errorf("%s", strings.Join(errors, "; "))
+	}
+	return nil
 }
 
 func timelineUsesAppium(timeline auto.Timeline) bool {
@@ -1639,6 +1818,11 @@ func runTimelineOnDevice(ctx context.Context, cfg commandConfig, label string, t
 	if output == nil {
 		output = io.Discard
 	}
+	output, closeOutput, err := deviceOutputWriter(output, cfg.deviceLogDir, target)
+	if err != nil {
+		return fmt.Errorf("device %d (%s): %w", target.DataIndex+1, displaySerial(target.Serial), err)
+	}
+	defer closeOutput()
 	device := adb.New(target.Serial, cfg.adbPath)
 	if dataSet == nil {
 		dataSet = &auto.DataSet{}
@@ -1648,15 +1832,24 @@ func runTimelineOnDevice(ctx context.Context, cfg commandConfig, label string, t
 		return fmt.Errorf("device %d (%s): %w", target.DataIndex+1, device.Serial, err)
 	}
 	maps.Copy(variables, auto.DeviceVariables(target.DataIndex, device.Serial))
+	variables["device.port_index"] = strconv.Itoa(target.PortIndex)
 
-	fmt.Fprintf(output, "[device %d serial %s] Starting %s with data index %d\n", target.DataIndex+1, device.Serial, label, target.DataIndex)
+	appiumURL := target.AppiumURL
+	if appiumURL == "" {
+		appiumURL = cfg.appiumURL
+	}
+	fmt.Fprintf(output, "[device %d serial %s] Starting %s with data index %d port index %d\n", target.DataIndex+1, device.Serial, label, target.DataIndex, target.PortIndex)
 	runner := auto.Runner{
-		Device:          device,
-		Ocr:             ocr.NewTesseract(cfg.tesseractPath),
-		AppiumServerURL: cfg.appiumURL,
-		DataDir:         cfg.dataDir,
-		Output:          output,
-		Variables:       variables,
+		Device:                     device,
+		Ocr:                        ocr.NewTesseract(cfg.tesseractPath),
+		AppiumServerURL:            appiumURL,
+		AppiumSessionLimiter:       cfg.appiumSessionLimiter,
+		AppiumSystemPortBase:       cfg.appiumSystemPortBase,
+		AppiumMjpegPortBase:        cfg.appiumMjpegPortBase,
+		AppiumChromedriverPortBase: cfg.appiumChromedriverPortBase,
+		DataDir:                    cfg.dataDir,
+		Output:                     output,
+		Variables:                  variables,
 	}
 	if err := runner.RunFrom(ctx, timeline, cfg.timeLineIndex); err != nil {
 		return fmt.Errorf("device %d (%s): %w", target.DataIndex+1, device.Serial, err)
@@ -1664,4 +1857,38 @@ func runTimelineOnDevice(ctx context.Context, cfg commandConfig, label string, t
 	fmt.Fprintf(output, "[device %d serial %s] Finished %s\n", target.DataIndex+1, device.Serial, label)
 
 	return nil
+}
+
+func deviceOutputWriter(output io.Writer, logDir string, target deviceTarget) (io.Writer, func(), error) {
+	logDir = strings.TrimSpace(logDir)
+	if logDir == "" {
+		return output, func() {}, nil
+	}
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		return nil, nil, fmt.Errorf("create device log dir %s: %w", logDir, err)
+	}
+	path := filepath.Join(logDir, fmt.Sprintf("device-%02d-%s.log", target.DataIndex+1, safeLogFileName(displaySerial(target.Serial))))
+	file, err := os.Create(path)
+	if err != nil {
+		return nil, nil, fmt.Errorf("create device log %s: %w", path, err)
+	}
+	fmt.Fprintf(output, "[device %d serial %s] Logging to %s\n", target.DataIndex+1, displaySerial(target.Serial), path)
+	return io.MultiWriter(output, file), func() { _ = file.Close() }, nil
+}
+
+func safeLogFileName(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "default"
+	}
+	var builder strings.Builder
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_', r == '.':
+			builder.WriteRune(r)
+		default:
+			builder.WriteByte('_')
+		}
+	}
+	return builder.String()
 }

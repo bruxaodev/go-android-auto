@@ -135,6 +135,47 @@ func TestAppiumServerArgsUsesConfiguredURL(t *testing.T) {
 	require.Equal(t, []string{"server", "--address", "127.0.0.1", "--port", "4729", "--base-path", "/wd/hub"}, args)
 }
 
+func TestAppiumShardURLsIncrementPorts(t *testing.T) {
+	urls, err := appiumShardURLs("http://127.0.0.1:4723/wd/hub", 3)
+
+	require.NoError(t, err)
+	require.Equal(t, []string{
+		"http://127.0.0.1:4723/wd/hub",
+		"http://127.0.0.1:4724/wd/hub",
+		"http://127.0.0.1:4725/wd/hub",
+	}, urls)
+}
+
+func TestAppiumServerURLsUsesExplicitShardList(t *testing.T) {
+	urls, err := appiumServerURLs(commandConfig{appiumURLs: "http://127.0.0.1:5000, http://127.0.0.1:5001/"}, 100)
+
+	require.NoError(t, err)
+	require.Equal(t, []string{"http://127.0.0.1:5000", "http://127.0.0.1:5001"}, urls)
+}
+
+func TestAppiumServerURLsAutoSizesByDeviceCount(t *testing.T) {
+	urls, err := appiumServerURLs(commandConfig{}, 21)
+
+	require.NoError(t, err)
+	require.Len(t, urls, 3)
+	require.Equal(t, "http://127.0.0.1:4723", urls[0])
+	require.Equal(t, "http://127.0.0.1:4725", urls[2])
+}
+
+func TestAssignAppiumTargetsRoundRobinsURLsAndPortIndexes(t *testing.T) {
+	targets := assignAppiumTargets([]deviceTarget{
+		{Serial: "device-a", DataIndex: 7},
+		{Serial: "device-b", DataIndex: 3},
+		{Serial: "device-c", DataIndex: 1},
+	}, []string{"http://127.0.0.1:4723", "http://127.0.0.1:4724"})
+
+	require.Equal(t, []deviceTarget{
+		{Serial: "device-a", DataIndex: 7, PortIndex: 0, AppiumURL: "http://127.0.0.1:4723"},
+		{Serial: "device-b", DataIndex: 3, PortIndex: 1, AppiumURL: "http://127.0.0.1:4724"},
+		{Serial: "device-c", DataIndex: 1, PortIndex: 2, AppiumURL: "http://127.0.0.1:4723"},
+	}, targets)
+}
+
 func TestDoctorReportsReadyForDefaultConfig(t *testing.T) {
 	paths := setTestConfigHome(t)
 	adbPath := createDevicesADB(t, []string{"device-a"})
@@ -493,7 +534,7 @@ func TestSaveDeviceMapCreatesParentDirectory(t *testing.T) {
 func TestRunTimelineOnDevicesContinuesAndRunsFallbackOnFailedDevice(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "adb.log")
 	adbPath := createFailingTimelineADB(t, logPath)
-	cfg := commandConfig{adbPath: adbPath}
+	cfg := commandConfig{adbPath: adbPath, deviceLogDir: ""}
 	timeline := auto.Timeline{
 		{Type: auto.CommandADB, Action: auto.ActionShell, Args: []string{"ok-main"}},
 		{Type: auto.CommandADB, Action: auto.ActionShell, Args: []string{"fail-main"}},
@@ -523,6 +564,28 @@ func TestRunTimelineOnDevicesContinuesAndRunsFallbackOnFailedDevice(t *testing.T
 	require.Contains(t, logContent, "-s device-b shell fail-main")
 	require.Contains(t, logContent, "-s device-b shell after-main")
 	require.NotContains(t, logContent, "-s device-b shell reset-display")
+}
+
+func TestRunTimelineOnDevicesWritesPerDeviceLogs(t *testing.T) {
+	logDir := filepath.Join(t.TempDir(), "logs")
+	adbPath := createFailingTimelineADB(t, filepath.Join(t.TempDir(), "adb.log"))
+	cfg := commandConfig{adbPath: adbPath, deviceLogDir: logDir}
+	timeline := auto.Timeline{{Type: auto.CommandADB, Action: auto.ActionShell, Args: []string{"ok-main"}}}
+	targets := []deviceTarget{
+		{Serial: "device/a", DataIndex: 0, PortIndex: 0},
+		{Serial: "device-b", DataIndex: 1, PortIndex: 1},
+	}
+
+	err := runTimelineOnDevices(context.Background(), cfg, timeline, nil, nil, targets)
+
+	require.NoError(t, err)
+	firstLog := filepath.Join(logDir, "device-01-device_a.log")
+	secondLog := filepath.Join(logDir, "device-02-device-b.log")
+	require.FileExists(t, firstLog)
+	require.FileExists(t, secondLog)
+	content, err := os.ReadFile(firstLog)
+	require.NoError(t, err)
+	require.Contains(t, string(content), "Starting timeline with data index 0 port index 0")
 }
 
 func TestLoadFallbackTimelineUsesEmbeddedPath(t *testing.T) {
