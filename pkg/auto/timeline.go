@@ -67,6 +67,10 @@ const (
 var (
 	ocrOperationSlots          = make(chan struct{}, 1)
 	appiumSessionCreationSlots = make(chan struct{}, 1)
+	builtinVariableRoots       = map[string]struct{}{
+		"data":   {},
+		"device": {},
+	}
 )
 
 type CommandType string
@@ -606,6 +610,127 @@ func resolveVariables(value string, variables map[string]string) (string, error)
 	}
 
 	return resolved, nil
+}
+
+func DataFileReferences(timelines ...Timeline) map[string]struct{} {
+	produced := make(map[string]struct{})
+	used := make(map[string]struct{})
+	for _, timeline := range timelines {
+		collectTimelineDataFileReferences(timeline, produced, used)
+	}
+	return used
+}
+
+func collectTimelineDataFileReferences(timeline Timeline, produced map[string]struct{}, used map[string]struct{}) {
+	for _, command := range timeline {
+		for _, key := range command.variableReferences() {
+			name := dataFileNameFromVariable(key)
+			if name == "" {
+				continue
+			}
+			if _, ok := produced[name]; ok {
+				continue
+			}
+			used[name] = struct{}{}
+		}
+		for _, name := range command.producedVariableNames() {
+			delete(used, name)
+			produced[name] = struct{}{}
+		}
+		for _, raceTimeline := range command.raceTimelines {
+			collectTimelineDataFileReferences(raceTimeline, produced, used)
+		}
+	}
+}
+
+func (c Command) variableReferences() []string {
+	values := []string{
+		c.Name,
+		string(c.Then),
+		c.Key,
+		c.Text,
+		c.Find,
+		c.ValueSuffix,
+		c.Apk,
+		c.Package,
+		c.Screenshot,
+		c.Output,
+		c.OutputKey,
+		c.OCRLang,
+		c.AppiumURL,
+		c.Using,
+		c.Size,
+		c.WaitBefore,
+		c.WaitAfter,
+		c.Timeout,
+		c.Interval,
+	}
+	values = append(values, c.Args...)
+	appendCapabilityStrings(c.Capabilities, &values)
+
+	refs := make([]string, 0)
+	for _, value := range values {
+		for _, match := range variablePattern.FindAllStringSubmatch(value, -1) {
+			if len(match) == 2 {
+				refs = append(refs, match[1])
+			}
+		}
+	}
+	return refs
+}
+
+func appendCapabilityStrings(value any, values *[]string) {
+	switch typed := value.(type) {
+	case string:
+		*values = append(*values, typed)
+	case []any:
+		for _, item := range typed {
+			appendCapabilityStrings(item, values)
+		}
+	case map[string]any:
+		for key, item := range typed {
+			*values = append(*values, key)
+			appendCapabilityStrings(item, values)
+		}
+	case map[any]any:
+		for key, item := range typed {
+			if keyText, ok := key.(string); ok {
+				*values = append(*values, keyText)
+			}
+			appendCapabilityStrings(item, values)
+		}
+	}
+}
+
+func (c Command) producedVariableNames() []string {
+	names := make([]string, 0, 2)
+	if outputKey := normalizeVariableKey(c.OutputKey); outputKey != "" && !strings.Contains(outputKey, "{{") {
+		names = append(names, outputKey)
+	}
+	if strings.EqualFold(filepath.Ext(c.Output), ".csv") && !strings.Contains(c.Output, "{{") {
+		if outputName := normalizeVariableKey(strings.TrimSuffix(filepath.Base(c.Output), filepath.Ext(c.Output))); outputName != "" {
+			names = append(names, outputName)
+		}
+	}
+	return names
+}
+
+func dataFileNameFromVariable(key string) string {
+	key = normalizeVariableKey(key)
+	if key == "" {
+		return ""
+	}
+	parts := strings.Split(key, ".")
+	if len(parts) > 0 && parts[0] == "data" {
+		parts = parts[1:]
+	}
+	if len(parts) == 0 || parts[0] == "" {
+		return ""
+	}
+	if _, ok := builtinVariableRoots[parts[0]]; ok {
+		return ""
+	}
+	return parts[0]
 }
 
 func (c Command) sleep(ctx context.Context, field string, raw string) error {

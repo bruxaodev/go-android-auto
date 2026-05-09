@@ -39,6 +39,20 @@ func TestLoadDataDirVariablesForMissingRow(t *testing.T) {
 	require.Contains(t, err.Error(), "missing row for device index 2")
 }
 
+func TestLoadDataDirFilesSkipsUnusedShortCSV(t *testing.T) {
+	dataDir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dataDir, "user.csv"), []byte("username\none\ntwo\nthree\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dataDir, "search.csv"), []byte("query\nfirst\n"), 0o644))
+
+	dataSet, err := LoadDataDirFiles(dataDir, map[string]struct{}{"user": {}})
+	require.NoError(t, err)
+
+	variables, err := dataSet.VariablesForDevice(2, "device-c")
+	require.NoError(t, err)
+	require.Equal(t, "three", variables["user"])
+	require.Empty(t, variables["search"])
+}
+
 func TestLoadDataDirVariablesForUsesSingleRowCSVForEveryDevice(t *testing.T) {
 	dataDir := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(dataDir, "password.csv"), []byte("password\nshared-secret\n"), 0o644))

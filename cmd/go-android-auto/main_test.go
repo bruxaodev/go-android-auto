@@ -8,6 +8,7 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -116,6 +117,40 @@ func TestParseFlagsCopiesEmbeddedDefaultsToAppConfig(t *testing.T) {
 	require.FileExists(t, filepath.Join(paths.AutomationDir, "search-google.yaml"))
 	require.FileExists(t, filepath.Join(paths.AutomationDir, "utils", "chrome", "search.yaml"))
 	require.FileExists(t, filepath.Join(paths.DataDir, "search.csv"))
+}
+
+func TestParseFlagsDoesNotCopyDefaultsWhenConfigDirsHaveFiles(t *testing.T) {
+	paths := setTestConfigHome(t)
+	require.NoError(t, os.MkdirAll(paths.AutomationDir, 0o755))
+	require.NoError(t, os.MkdirAll(paths.DataDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(paths.AutomationDir, "custom.yaml"), []byte("[]"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(paths.DataDir, "custom.csv"), []byte("value\ncustom\n"), 0o644))
+
+	cfg := commandConfig{}
+	parseFlags(&cfg, nil)
+
+	require.FileExists(t, filepath.Join(paths.AutomationDir, "custom.yaml"))
+	require.FileExists(t, filepath.Join(paths.DataDir, "custom.csv"))
+	require.NoFileExists(t, filepath.Join(paths.AutomationDir, "search-google.yaml"))
+	require.NoFileExists(t, filepath.Join(paths.DataDir, "search.csv"))
+}
+
+func TestRunCommandOnlyValidatesCSVFilesReferencedByTimeline(t *testing.T) {
+	dataDir := t.TempDir()
+	timelinePath := filepath.Join(t.TempDir(), "timeline.yaml")
+	adbPath := createDevicesADB(t, []string{"device-b"})
+	require.NoError(t, os.WriteFile(filepath.Join(dataDir, "user.csv"), []byte("username\none\ntwo\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dataDir, "search.csv"), []byte("query\nfirst\n"), 0o644))
+	require.NoError(t, os.WriteFile(timelinePath, []byte(`
+- type: adb
+  action: text
+  text: '{{user.username}}'
+`), 0o644))
+	cfg := commandConfig{timeLinePath: timelinePath, dataDir: dataDir, adbPath: adbPath, deviceSerial: "device-b", deviceIDs: "2", deviceLogDir: ""}
+
+	err := runCommandWithOutput(context.Background(), cfg, nil, io.Discard)
+
+	require.NoError(t, err)
 }
 
 func TestResolveTimelinePathFallsBackToAutomationDir(t *testing.T) {

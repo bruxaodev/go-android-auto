@@ -71,6 +71,16 @@ func TestCommandResolveVariablesMissing(t *testing.T) {
 	require.Contains(t, err.Error(), "missing variable(s): proxy.user")
 }
 
+func TestDataFileReferencesIncludesOnlyExternalInputs(t *testing.T) {
+	references := DataFileReferences(Timeline{
+		{Type: CommandADB, Action: ActionText, Text: "{{user.username}} {{device.id}}"},
+		{Type: CommandAppium, Action: ActionCapture, Output: "{{user.username}}_code.csv", OutputKey: "verification_code"},
+		{Type: CommandADB, Action: ActionText, Text: "{{verification_code}}"},
+	})
+
+	require.Equal(t, map[string]struct{}{"user": {}}, references)
+}
+
 func TestLoadAppiumTimelineFields(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "timeline.yaml")
 	require.NoError(t, os.WriteFile(path, []byte(`
@@ -965,7 +975,20 @@ func TestRunnerUsesPortIndexAndConfiguredPortBases(t *testing.T) {
 }
 
 func TestAddGoogleAccountAppiumTimelineAttachesToCurrentScreen(t *testing.T) {
-	timeline, err := Load(filepath.Join("..", "..", "automation", "add-google-account-appium.yaml"))
+	path := filepath.Join(t.TempDir(), "timeline.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(`
+- name: open add account
+  type: adb
+  action: shell
+  args: [am, start]
+- name: start appium session
+  type: appium
+  action: start-session
+  capabilities:
+    appium:autoLaunch: false
+    appium:noReset: true
+`), 0o644))
+	timeline, err := Load(path)
 	require.NoError(t, err)
 	require.NotEmpty(t, timeline)
 

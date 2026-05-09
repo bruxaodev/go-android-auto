@@ -184,7 +184,7 @@ func runCommandWithOutput(ctx context.Context, cfg commandConfig, flags *flag.Fl
 		return fmt.Errorf("Error loading fallback timeline: %w", err)
 	}
 
-	dataSet, err := auto.LoadDataDir(cfg.dataDir)
+	dataSet, err := auto.LoadDataDirFiles(cfg.dataDir, auto.DataFileReferences(timeline, fallbackTimeline))
 	if err != nil {
 		return fmt.Errorf("Error loading data: %w", err)
 	}
@@ -557,16 +557,51 @@ func ensureDefaultAppConfigDirs(paths appConfigPaths) error {
 
 func installDefaultAppConfigFiles(paths appConfigPaths, flags *flag.FlagSet) error {
 	if !flagProvided(flags, "automation") {
-		if err := copyEmbeddedConfigDir(goandroidauto.DefaultFiles, configAutomationDirName, paths.AutomationDir, map[string]struct{}{".yaml": {}, ".yml": {}}); err != nil {
+		hasFiles, err := directoryHasFiles(paths.AutomationDir)
+		if err != nil {
 			return err
+		}
+		if !hasFiles {
+			if err := copyEmbeddedConfigDir(goandroidauto.DefaultFiles, configAutomationDirName, paths.AutomationDir, map[string]struct{}{".yaml": {}, ".yml": {}}); err != nil {
+				return err
+			}
 		}
 	}
 	if !flagProvided(flags, "values") {
-		if err := copyEmbeddedConfigDir(goandroidauto.DefaultFiles, configValuesDirName, paths.DataDir, map[string]struct{}{".csv": {}}); err != nil {
+		hasFiles, err := directoryHasFiles(paths.DataDir)
+		if err != nil {
 			return err
+		}
+		if !hasFiles {
+			if err := copyEmbeddedConfigDir(goandroidauto.DefaultFiles, configValuesDirName, paths.DataDir, map[string]struct{}{".csv": {}}); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
+}
+
+func directoryHasFiles(path string) (bool, error) {
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("read app config directory %s: %w", path, err)
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			return true, nil
+		}
+		hasFiles, err := directoryHasFiles(filepath.Join(path, entry.Name()))
+		if err != nil {
+			return false, err
+		}
+		if hasFiles {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func flagProvided(flags *flag.FlagSet, name string) bool {

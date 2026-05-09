@@ -33,6 +33,14 @@ const (
 var deviceValueCSVMu sync.Mutex
 
 func LoadDataDir(path string) (*DataSet, error) {
+	return loadDataDir(path, nil)
+}
+
+func LoadDataDirFiles(path string, names map[string]struct{}) (*DataSet, error) {
+	return loadDataDir(path, names)
+}
+
+func loadDataDir(path string, names map[string]struct{}) (*DataSet, error) {
 	if path == "" {
 		return &DataSet{}, nil
 	}
@@ -52,6 +60,12 @@ func LoadDataDir(path string) (*DataSet, error) {
 	for _, entry := range entries {
 		if entry.IsDir() || strings.ToLower(filepath.Ext(entry.Name())) != ".csv" {
 			continue
+		}
+		name := normalizeVariableKey(strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name())))
+		if names != nil {
+			if _, ok := names[name]; !ok {
+				continue
+			}
 		}
 
 		dataFile, err := loadCSVDataFile(filepath.Join(path, entry.Name()))
