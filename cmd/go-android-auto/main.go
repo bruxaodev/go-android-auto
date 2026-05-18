@@ -65,6 +65,7 @@ type commandConfig struct {
 	deviceLogDir               string
 	dataDir                    string
 	doctor                     bool
+	mcp                        bool
 }
 
 const (
@@ -134,6 +135,12 @@ func main() {
 	cfg := commandConfig{}
 
 	flags := parseFlags(&cfg, os.Args[1:])
+	if cfg.mcp {
+		if err := runMCPServer(ctx, cfg, os.Stdin, os.Stdout); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	if err := runCommand(ctx, cfg, flags); err != nil {
 		log.Fatal(err)
 	}
@@ -522,6 +529,7 @@ func parseFlags(cfg *commandConfig, args []string) *flag.FlagSet {
 	flags.StringVar(&cfg.deviceLogDir, "device-log-dir", defaultDeviceLogDir, "Directory for per-device log files during multi-device runs; empty disables files")
 	flags.StringVar(&cfg.dataDir, "values", configPaths.DataDir, "Directory with CSV data files used by {{file.column}} timeline variables")
 	flags.BoolVar(&cfg.doctor, "doctor", false, "Check config, dependencies, devices, and selected timeline readiness")
+	flags.BoolVar(&cfg.mcp, "mcp", false, "Run a stdio MCP server for AI-controlled Android automation")
 	if err := flags.Parse(args); err != nil {
 		log.Fatal(err)
 	}
