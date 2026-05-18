@@ -1842,6 +1842,9 @@ func runTimelineOnDevices(ctx context.Context, cfg commandConfig, timeline auto.
 
 	wg.Wait()
 	close(errors)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	messages := make([]string, 0)
 	for err := range errors {
@@ -1858,7 +1861,13 @@ func runTimelineOnDevices(ctx context.Context, cfg commandConfig, timeline auto.
 func runTimelineOnDevicesQueued(ctx context.Context, cfg commandConfig, timeline auto.Timeline, fallbackTimeline auto.Timeline, dataSet *auto.DataSet, targets []deviceTarget, output io.Writer) error {
 	messages := make([]string, 0)
 	for _, target := range targets {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err := runTimelineOnDeviceWithFallback(ctx, cfg, timeline, fallbackTimeline, dataSet, target, output); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
 			messages = append(messages, err.Error())
 		}
 	}
@@ -1875,6 +1884,9 @@ func runTimelineOnDeviceWithFallback(ctx context.Context, cfg commandConfig, tim
 	}
 	if len(fallbackTimeline) == 0 {
 		return mainErr
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
 	}
 
 	fallbackCfg := cfg

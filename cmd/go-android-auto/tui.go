@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -153,6 +154,7 @@ type tuiModel struct {
 	status                   string
 	action                   tuiAction
 	running                  bool
+	runCancel                context.CancelFunc
 	logs                     []string
 	logChan                  <-chan tea.Msg
 	width                    int
@@ -207,8 +209,14 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, waitForTUILog(m.logChan)
 	case tuiRunDoneMsg:
 		m.running = false
+		m.runCancel = nil
 		m.logChan = nil
 		if msg.Err != nil {
+			if errors.Is(msg.Err, context.Canceled) {
+				m.status = "run stopped"
+				m.appendLog(tuiStatusStyle.Render("stopped by user"))
+				return m, nil
+			}
 			m.status = "run failed"
 			m.appendLog(tuiErrorStyle.Render("failed: " + msg.Err.Error()))
 		} else {
@@ -225,8 +233,18 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateAppiumURLEdit(msg)
 		}
 		switch msg.String() {
-		case "ctrl+c", "esc", "q":
+		case "ctrl+c", "esc":
+			if m.running {
+				m.stopCommand()
+				return m, nil
+			}
 			return m, tea.Quit
+		case "q":
+			return m, tea.Quit
+		case "s":
+			if m.running {
+				m.stopCommand()
+			}
 		case "tab":
 			m.nextSection()
 		case "shift+tab":
@@ -362,8 +380,14 @@ func (m tuiModel) renderFooter(width int) string {
 		return tuiFooterStyle.Width(width).Render(trimLogLine("editing appium urls | type URLs separated by comma | enter save | esc cancel", width-2))
 	}
 	keys := "tab sections | up/down move | left/right adjust | space select | a all | x none | enter action | q quit"
+	if m.running {
+		keys = "s/ctrl+c stop current run | tab sections | up/down move | enter stop | q quit"
+	}
 	if width < 88 {
 		keys = "tab sections | arrows move/adjust | space select | enter action | q quit"
+		if m.running {
+			keys = "s/ctrl+c stop | enter stop | q quit"
+		}
 	}
 	return tuiFooterStyle.Width(width).Render(trimLogLine(keys, width-2))
 }
@@ -529,8 +553,12 @@ func (m tuiModel) optionLabels() []string {
 	if m.detectDeviceIDs {
 		detect = "on"
 	}
+	runLabel := "run selected script"
+	if m.running {
+		runLabel = "stop current run"
+	}
 	return []string{
-		"run selected script",
+		runLabel,
 		"setup device map",
 		"select all devices",
 		"clear device selection",
@@ -645,6 +673,10 @@ func (m *tuiModel) toggleCurrent() {
 }
 
 func (m *tuiModel) activateCurrent() tea.Cmd {
+	if m.running {
+		m.stopCommand()
+		return nil
+	}
 	switch m.section {
 	case tuiSectionScripts:
 		m.section = tuiSectionDevices
@@ -658,7 +690,11 @@ func (m *tuiModel) activateCurrent() tea.Cmd {
 
 func (m *tuiModel) activateOption(option tuiOption) tea.Cmd {
 	if m.running && option != tuiOptionQuit {
-		m.status = "wait for current run to finish"
+		if option == tuiOptionRun {
+			m.stopCommand()
+		} else {
+			m.status = "stop current run before changing options"
+		}
 		return nil
 	}
 	switch option {
@@ -793,17 +829,34 @@ func (m tuiModel) updateAppiumURLEdit(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m *tuiModel) startCommand(label string, run func(context.Context, io.Writer) error) tea.Cmd {
 	messages := make(chan tea.Msg, 64)
 	writer := &tuiOutputWriter{message: func(msg tea.Msg) { messages <- msg }}
+	runCtx, cancel := context.WithCancel(m.ctx)
 	m.running = true
+	m.runCancel = cancel
 	m.status = label + " started"
 	m.logChan = messages
 	m.logs = []string{tuiStatusStyle.Render("starting " + label + "...")}
 	go func() {
-		err := run(m.ctx, writer)
+		defer cancel()
+		err := run(runCtx, writer)
 		writer.Close()
 		messages <- tuiRunDoneMsg{Err: err}
 		close(messages)
 	}()
 	return waitForTUILog(messages)
+}
+
+func (m *tuiModel) stopCommand() {
+	if !m.running {
+		m.status = "no run in progress"
+		return
+	}
+	if m.runCancel == nil {
+		m.status = "current run cannot be stopped"
+		return
+	}
+	m.runCancel()
+	m.status = "stopping current run"
+	m.appendLog(tuiStatusStyle.Render("stopping current run..."))
 }
 
 func waitForTUILog(messages <-chan tea.Msg) tea.Cmd {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -210,6 +211,17 @@ func TestTUIOutputWriterEmitsLines(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, len("first\nsecond"), n)
 	require.Equal(t, []tea.Msg{tuiRunLogMsg("first"), tuiRunLogMsg("second")}, messages)
+}
+
+func TestTUIStopCommandCancelsCurrentRun(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	m := tuiModel{running: true, runCancel: cancel}
+
+	m.stopCommand()
+
+	require.ErrorIs(t, ctx.Err(), context.Canceled)
+	require.Equal(t, "stopping current run", m.status)
+	require.Contains(t, stripANSI(strings.Join(m.logs, "\n")), "stopping current run")
 }
 
 func scriptNames(scripts []tuiScript) []string {

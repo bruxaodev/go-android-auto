@@ -639,6 +639,28 @@ func TestRunTimelineOnDevicesContinuesAndRunsFallbackOnFailedDevice(t *testing.T
 	require.NotContains(t, logContent, "-s device-b shell reset-display")
 }
 
+func TestRunTimelineOnDeviceCancellationDoesNotRunFallback(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "adb.log")
+	adbPath := createSlowTimelineADB(t, logPath)
+	cfg := commandConfig{adbPath: adbPath, deviceLogDir: ""}
+	timeline := auto.Timeline{{Type: auto.CommandADB, Action: auto.ActionShell, Args: []string{"slow-main"}}}
+	fallbackTimeline := auto.Timeline{{Type: auto.CommandADB, Action: auto.ActionShell, Args: []string{"reset-display"}}}
+	target := deviceTarget{Serial: "device-a", DataIndex: 0}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := runTimelineOnDeviceWithFallback(ctx, cfg, timeline, fallbackTimeline, nil, target, io.Discard)
+
+	require.ErrorIs(t, err, context.Canceled)
+	content, readErr := os.ReadFile(logPath)
+	if errors.Is(readErr, os.ErrNotExist) {
+		content = nil
+	} else {
+		require.NoError(t, readErr)
+	}
+	require.NotContains(t, string(content), "reset-display")
+}
+
 func TestRunTimelineOnDevicesQueueRunsOneDeviceAtATime(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "adb.log")
 	adbPath := createSlowTimelineADB(t, logPath)
