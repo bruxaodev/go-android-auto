@@ -273,6 +273,40 @@ func TestLoadRejectsTimelineIncludeCycle(t *testing.T) {
 	require.Contains(t, err.Error(), "timeline include cycle")
 }
 
+func TestLoadPreservesRepeatTimeline(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "root.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(`
+- name: skip sponsored
+  type: timeline
+  action: repeat
+  optional: true
+  timeline: child.yaml
+- name: after loop
+  type: adb
+  action: text
+  text: done
+`), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "child.yaml"), []byte(`
+- name: sponsored marker exists
+  type: appium
+  action: wait
+  using: xpath
+  find: '//android.view.ViewGroup[@content-desc="Patrocinado"]'
+`), 0o644))
+
+	timeline, err := Load(path)
+
+	require.NoError(t, err)
+	require.Len(t, timeline, 2)
+	require.Equal(t, CommandTimeline, timeline[0].Type)
+	require.Equal(t, ActionRepeat, timeline[0].Action)
+	require.True(t, timeline[0].Optional)
+	require.Len(t, timeline[0].repeatTimeline, 1)
+	require.Equal(t, CommandAppium, timeline[0].repeatTimeline[0].Type)
+	require.Equal(t, "after loop", timeline[1].Name)
+}
+
 func TestRunnerInterleavesADBAndAppiumActions(t *testing.T) {
 	events := timelineEvents{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -341,6 +375,8 @@ func TestRunnerInterleavesADBAndAppiumActions(t *testing.T) {
 		"appium click",
 		"adb text done",
 		"appium delete",
+		"adb forward remove 8201",
+		"adb forward remove 9201",
 	}, events.values())
 }
 
@@ -646,6 +682,142 @@ func TestRunnerRaceTimelineOptionalIgnoresAllFailures(t *testing.T) {
 	})
 
 	require.NoError(t, err)
+}
+
+func TestRunnerRepeatTimelineStopsOnOptionalFailure(t *testing.T) {
+	events := timelineEvents{}
+	failuresLeft := 2
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case "POST /session":
+			events.append("appium session")
+			_, _ = w.Write([]byte(`{"value":{"sessionId":"session-1","capabilities":{}}}`))
+		case "POST /session/session-1/element":
+			events.append("appium find sponsored")
+			if failuresLeft > 0 {
+				failuresLeft--
+				_, _ = w.Write([]byte(`{"value":{"element-6066-11e4-a52e-4f735466cecf":"element-1"}}`))
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"value":{"error":"no such element","message":"not found"}}`))
+		case "DELETE /session/session-1":
+			events.append("appium delete")
+			_, _ = w.Write([]byte(`{"value":null}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	x1, y1, x2, y2 := 10, 20, 30, 40
+	runner := Runner{Device: &recordingDevice{events: &events}, Ocr: fakeOCR{}, AppiumServerURL: server.URL, Output: io.Discard}
+
+	err := runner.Run(context.Background(), Timeline{
+		{
+			Type:     CommandTimeline,
+			Action:   ActionRepeat,
+			Optional: true,
+			repeatTimeline: Timeline{
+				{Type: CommandADB, Action: ActionSwipe, X1: &x1, Y1: &y1, X2: &x2, Y2: &y2},
+				{Type: CommandAppium, Action: ActionWait, Using: "xpath", Find: `//android.view.ViewGroup[@content-desc="Patrocinado"]`, Timeout: "20ms", Interval: "1ms"},
+			},
+		},
+		{Type: CommandADB, Action: ActionText, Text: "content-ready"},
+	})
+
+	require.NoError(t, err)
+	values := events.values()
+	require.Equal(t, "adb swipe 10 20 30 40", values[0])
+	require.Equal(t, "appium session", values[1])
+	require.Equal(t, "adb swipe 10 20 30 40", values[3])
+	require.Equal(t, "adb swipe 10 20 30 40", values[5])
+	require.Contains(t, values, "adb text content-ready")
+	require.Contains(t, values, "appium delete")
+	require.Equal(t, 3, countTimelineEvents(values, "adb swipe 10 20 30 40"))
+	require.GreaterOrEqual(t, countTimelineEvents(values, "appium find sponsored"), 3)
+}
+
+func TestRunnerRepeatTimelineCancels(t *testing.T) {
+	x1, y1, x2, y2 := 10, 20, 30, 40
+	runner := Runner{Device: &recordingDevice{}, Ocr: fakeOCR{}, Output: io.Discard}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := runner.Run(ctx, Timeline{{
+		Type:   CommandTimeline,
+		Action: ActionRepeat,
+		repeatTimeline: Timeline{
+			{Type: CommandADB, Action: ActionSwipe, X1: &x1, Y1: &y1, X2: &x2, Y2: &y2},
+		},
+	}})
+
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestRunnerSkipsOptionalCommandFailure(t *testing.T) {
+	events := timelineEvents{}
+	runner := Runner{Device: &recordingDevice{events: &events}, Ocr: targetOCR{}, Output: io.Discard}
+
+	err := runner.Run(context.Background(), Timeline{
+		{Type: CommandOCR, Action: ActionTap, Find: "missing", Optional: true},
+		{Type: CommandADB, Action: ActionText, Text: "continued"},
+	})
+
+	require.NoError(t, err)
+	require.Contains(t, events.values(), "adb text continued")
+}
+
+func TestRunnerDoesNotSkipOptionalCommandCancellation(t *testing.T) {
+	runner := Runner{Device: &recordingDevice{}, Ocr: fakeOCR{}, Output: io.Discard}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := runner.Run(ctx, Timeline{{Type: CommandOCR, Action: ActionTap, Find: "missing", Optional: true}})
+
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestRunnerClosesAppiumSessionAfterCancel(t *testing.T) {
+	requestStarted := make(chan struct{})
+	allowResponse := make(chan struct{})
+	requests := make(chan string, 4)
+	events := timelineEvents{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- r.Method + " " + r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case "POST /session":
+			_, _ = w.Write([]byte(`{"value":{"sessionId":"session-1","capabilities":{}}}`))
+		case "GET /session/session-1/source":
+			close(requestStarted)
+			<-allowResponse
+			_, _ = w.Write([]byte(`{"value":"<hierarchy/>"}`))
+		case "DELETE /session/session-1":
+			_, _ = w.Write([]byte(`{"value":null}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	runner := Runner{Device: &recordingDevice{events: &events}, Ocr: fakeOCR{}, AppiumServerURL: server.URL, Output: io.Discard}
+	ctx, cancel := context.WithCancel(context.Background())
+	errc := make(chan error, 1)
+	go func() {
+		errc <- runner.Run(ctx, Timeline{{Type: CommandAppium, Action: ActionCapture, Find: `missing`, Output: filepath.Join(t.TempDir(), "capture.txt")}})
+	}()
+
+	<-requestStarted
+	cancel()
+	close(allowResponse)
+
+	require.ErrorIs(t, <-errc, context.Canceled)
+	collected := collectRequests(requests, 3)
+	require.Contains(t, collected, "DELETE /session/session-1")
+	require.Contains(t, events.values(), "adb forward remove 8200")
+	require.Contains(t, events.values(), "adb forward remove 9200")
 }
 
 func TestRunnerWaitsForAppiumElementThenInputs(t *testing.T) {
@@ -1011,6 +1183,29 @@ func commandNames(timeline Timeline) []string {
 	return names
 }
 
+func countTimelineEvents(events []string, target string) int {
+	count := 0
+	for _, event := range events {
+		if event == target {
+			count++
+		}
+	}
+	return count
+}
+
+func collectRequests(requests <-chan string, count int) []string {
+	collected := make([]string, 0, count)
+	for len(collected) < count {
+		select {
+		case request := <-requests:
+			collected = append(collected, request)
+		case <-time.After(time.Second):
+			return collected
+		}
+	}
+	return collected
+}
+
 func (e *timelineEvents) append(value string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -1034,13 +1229,22 @@ func (d *recordingDevice) Connect(context.Context) (adb.CommandResult, error) {
 func (d *recordingDevice) Shell(context.Context, ...string) (adb.CommandResult, error) {
 	return adb.CommandResult{}, nil
 }
+func (d *recordingDevice) RemoveForward(_ context.Context, localPort int) (adb.CommandResult, error) {
+	if d.events != nil {
+		d.events.append("adb forward remove " + strconv.Itoa(localPort))
+	}
+	return adb.CommandResult{}, nil
+}
 func (d *recordingDevice) Tap(_ context.Context, x, y int) (adb.CommandResult, error) {
 	if d.events != nil {
 		d.events.append("adb tap " + strconv.Itoa(x) + " " + strconv.Itoa(y))
 	}
 	return adb.CommandResult{}, nil
 }
-func (d *recordingDevice) Swipe(context.Context, int, int, int, int) (adb.CommandResult, error) {
+func (d *recordingDevice) Swipe(_ context.Context, x1, y1, x2, y2 int) (adb.CommandResult, error) {
+	if d.events != nil {
+		d.events.append("adb swipe " + strconv.Itoa(x1) + " " + strconv.Itoa(y1) + " " + strconv.Itoa(x2) + " " + strconv.Itoa(y2))
+	}
 	return adb.CommandResult{}, nil
 }
 func (d *recordingDevice) KeyEvent(context.Context, string) (adb.CommandResult, error) {

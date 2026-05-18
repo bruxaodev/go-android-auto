@@ -3,6 +3,7 @@ package auto
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -27,6 +28,7 @@ type Device interface {
 	Devices(context.Context) ([]string, error)
 	Connect(context.Context) (adb.CommandResult, error)
 	Shell(ctx context.Context, args ...string) (adb.CommandResult, error)
+	RemoveForward(ctx context.Context, localPort int) (adb.CommandResult, error)
 	Tap(ctx context.Context, x, y int) (adb.CommandResult, error)
 	Swipe(ctx context.Context, x1, y1, x2, y2 int) (adb.CommandResult, error)
 	KeyEvent(ctx context.Context, keyCode string) (adb.CommandResult, error)
@@ -46,6 +48,7 @@ type Runner struct {
 	AppiumSystemPortBase       int
 	AppiumMjpegPortBase        int
 	AppiumChromedriverPortBase int
+	appiumSessionStarted       bool
 	BootTimeout                time.Duration
 	DataDir                    string
 	Output                     io.Writer
@@ -58,6 +61,7 @@ const (
 	defaultWaitTimeout          = 30 * time.Second
 	defaultWaitInterval         = time.Second
 	defaultAppiumSessionTimeout = 2 * time.Minute
+	defaultAppiumCleanupTimeout = 10 * time.Second
 	defaultAppiumTimeoutMS      = 120000
 	defaultAppiumSystemPortBase = 8200
 	defaultAppiumMjpegPortBase  = 9200
@@ -105,6 +109,7 @@ const (
 	ActionWait               Action = "wait"
 	ActionShell              Action = "shell"
 	ActionRace               Action = "race"
+	ActionRepeat             Action = "repeat"
 	ActionStartSession       Action = "start-session"
 	ActionQuitSession        Action = "quit-session"
 	ActionPageSource         Action = "page-source"
@@ -118,44 +123,45 @@ type LoadedTimeline struct {
 }
 
 type Command struct {
-	Name          string         `yaml:"name,omitempty"`
-	Type          CommandType    `yaml:"type"`
-	Action        Action         `yaml:"action"`
-	Then          Action         `yaml:"then,omitempty"`
-	Key           string         `yaml:"key,omitempty"`
-	Text          string         `yaml:"text,omitempty"`
-	Find          string         `yaml:"find,omitempty"`
-	ValueSuffix   string         `yaml:"value_suffix,omitempty"`
-	Apk           string         `yaml:"apk,omitempty"`
-	Package       string         `yaml:"package,omitempty"`
-	Args          []string       `yaml:"args,omitempty"`
-	Screenshot    string         `yaml:"screenshot,omitempty"`
-	Output        string         `yaml:"output,omitempty"`
-	OutputKey     string         `yaml:"output_key,omitempty"`
-	OCRLang       string         `yaml:"ocr_lang,omitempty"`
-	OCRPSM        int            `yaml:"ocr_psm,omitempty"`
-	AppiumURL     string         `yaml:"appium_url,omitempty"`
-	Using         string         `yaml:"using,omitempty"`
-	Capabilities  map[string]any `yaml:"capabilities,omitempty"`
-	Size          string         `yaml:"size,omitempty"`
-	HostPort      int            `yaml:"host_port,omitempty"`
-	DevicePort    int            `yaml:"device_port,omitempty"`
-	X             *int           `yaml:"x,omitempty"`
-	Y             *int           `yaml:"y,omitempty"`
-	X1            *int           `yaml:"x1,omitempty"`
-	Y1            *int           `yaml:"y1,omitempty"`
-	X2            *int           `yaml:"x2,omitempty"`
-	Y2            *int           `yaml:"y2,omitempty"`
-	WaitBefore    string         `yaml:"wait_before,omitempty"`
-	WaitAfter     string         `yaml:"wait_after,omitempty"`
-	Timeout       string         `yaml:"timeout,omitempty"`
-	Interval      string         `yaml:"interval,omitempty"`
-	MS            *int           `yaml:"ms,omitempty"`
-	TimelinePath  string         `yaml:"timeline,omitempty"`
-	TimelinePaths []string       `yaml:"timelines,omitempty"`
-	Optional      bool           `yaml:"optional,omitempty"`
-	FallbackPath  string         `yaml:"fallback,omitempty"`
-	raceTimelines []Timeline
+	Name           string         `yaml:"name,omitempty"`
+	Type           CommandType    `yaml:"type"`
+	Action         Action         `yaml:"action"`
+	Then           Action         `yaml:"then,omitempty"`
+	Key            string         `yaml:"key,omitempty"`
+	Text           string         `yaml:"text,omitempty"`
+	Find           string         `yaml:"find,omitempty"`
+	ValueSuffix    string         `yaml:"value_suffix,omitempty"`
+	Apk            string         `yaml:"apk,omitempty"`
+	Package        string         `yaml:"package,omitempty"`
+	Args           []string       `yaml:"args,omitempty"`
+	Screenshot     string         `yaml:"screenshot,omitempty"`
+	Output         string         `yaml:"output,omitempty"`
+	OutputKey      string         `yaml:"output_key,omitempty"`
+	OCRLang        string         `yaml:"ocr_lang,omitempty"`
+	OCRPSM         int            `yaml:"ocr_psm,omitempty"`
+	AppiumURL      string         `yaml:"appium_url,omitempty"`
+	Using          string         `yaml:"using,omitempty"`
+	Capabilities   map[string]any `yaml:"capabilities,omitempty"`
+	Size           string         `yaml:"size,omitempty"`
+	HostPort       int            `yaml:"host_port,omitempty"`
+	DevicePort     int            `yaml:"device_port,omitempty"`
+	X              *int           `yaml:"x,omitempty"`
+	Y              *int           `yaml:"y,omitempty"`
+	X1             *int           `yaml:"x1,omitempty"`
+	Y1             *int           `yaml:"y1,omitempty"`
+	X2             *int           `yaml:"x2,omitempty"`
+	Y2             *int           `yaml:"y2,omitempty"`
+	WaitBefore     string         `yaml:"wait_before,omitempty"`
+	WaitAfter      string         `yaml:"wait_after,omitempty"`
+	Timeout        string         `yaml:"timeout,omitempty"`
+	Interval       string         `yaml:"interval,omitempty"`
+	MS             *int           `yaml:"ms,omitempty"`
+	TimelinePath   string         `yaml:"timeline,omitempty"`
+	TimelinePaths  []string       `yaml:"timelines,omitempty"`
+	Optional       bool           `yaml:"optional,omitempty"`
+	FallbackPath   string         `yaml:"fallback,omitempty"`
+	raceTimelines  []Timeline
+	repeatTimeline Timeline
 }
 
 func Load(path string) (Timeline, error) {
@@ -247,6 +253,15 @@ func expandTimeline(timeline Timeline, sourcePath string, stack []string) (Timel
 			expanded = append(expanded, cmd)
 			continue
 		}
+		if cmd.Type == CommandTimeline && cmd.Action == ActionRepeat {
+			repeatTimeline, err := loadRepeatTimeline(cmd, sourcePath, stack)
+			if err != nil {
+				return nil, fmt.Errorf("timeline repeat command %d (%s) failed: %w", i, cmd.Name, err)
+			}
+			cmd.repeatTimeline = repeatTimeline
+			expanded = append(expanded, cmd)
+			continue
+		}
 		if cmd.Type != CommandTimeline && !(cmd.Type == "" && cmd.TimelinePath != "") {
 			expanded = append(expanded, cmd)
 			continue
@@ -294,6 +309,25 @@ func loadRaceTimelines(cmd Command, sourcePath string, stack []string) ([]Timeli
 	return timelines, nil
 }
 
+func loadRepeatTimeline(cmd Command, sourcePath string, stack []string) (Timeline, error) {
+	includePath := strings.TrimSpace(cmd.TimelinePath)
+	if includePath == "" {
+		return nil, fmt.Errorf("requires timeline")
+	}
+	if !filepath.IsAbs(includePath) {
+		includePath = filepath.Join(filepath.Dir(sourcePath), includePath)
+	}
+
+	includedTimeline, err := load(includePath, stack)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load %s: %w", includePath, err)
+	}
+	if len(includedTimeline.Timeline) == 0 {
+		return nil, fmt.Errorf("timeline is empty: %s", includePath)
+	}
+	return includedTimeline.Timeline, nil
+}
+
 func (r *Runner) Run(ctx context.Context, timeline Timeline) error {
 	return r.RunFrom(ctx, timeline, 0)
 }
@@ -316,7 +350,9 @@ func (r *Runner) runFrom(ctx context.Context, timeline Timeline, startIndex int,
 	}
 	if closeOnDone {
 		defer func() {
-			if closeErr := r.Close(ctx); err == nil && closeErr != nil {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), defaultAppiumCleanupTimeout)
+			defer cancel()
+			if closeErr := r.Close(cleanupCtx); err == nil && closeErr != nil {
 				err = closeErr
 			}
 		}()
@@ -324,6 +360,9 @@ func (r *Runner) runFrom(ctx context.Context, timeline Timeline, startIndex int,
 
 	timeline = timeline[startIndex:]
 	for i, cmd := range timeline {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err := cmd.run(ctx, r, startIndex+i); err != nil {
 			return err
 		}
@@ -339,9 +378,17 @@ type timelineRaceResult struct {
 }
 
 func (c Command) runTimelineCommand(ctx context.Context, r *Runner) error {
-	if c.Action != ActionRace {
+	switch c.Action {
+	case ActionRace:
+		return c.runRaceTimelineCommand(ctx, r)
+	case ActionRepeat:
+		return c.runRepeatTimelineCommand(ctx, r)
+	default:
 		return fmt.Errorf("unsupported timeline action %q", c.Action)
 	}
+}
+
+func (c Command) runRaceTimelineCommand(ctx context.Context, r *Runner) error {
 	if len(c.raceTimelines) == 0 {
 		return fmt.Errorf("timeline race requires timelines")
 	}
@@ -378,6 +425,50 @@ func (c Command) runTimelineCommand(ctx context.Context, r *Runner) error {
 		return nil
 	}
 	return fmt.Errorf("all race timelines failed: %s", strings.Join(failures, "; "))
+}
+
+func (c Command) runRepeatTimelineCommand(ctx context.Context, r *Runner) error {
+	if len(c.repeatTimeline) == 0 {
+		return fmt.Errorf("timeline repeat requires timeline")
+	}
+
+	repeatCtx := ctx
+	cancel := func() {}
+	if strings.TrimSpace(c.Timeout) != "" {
+		timeout, err := parsePositiveDuration("timeout", c.Timeout, 0)
+		if err != nil {
+			return err
+		}
+		repeatCtx, cancel = context.WithTimeout(ctx, timeout)
+	}
+	defer cancel()
+
+	for {
+		if err := repeatCtx.Err(); err != nil {
+			return err
+		}
+		err := r.runFrom(repeatCtx, c.repeatTimeline, 0, false)
+		if err != nil {
+			if repeatErr := repeatCtx.Err(); repeatErr != nil {
+				return repeatErr
+			}
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			if errors.Is(err, context.Canceled) {
+				return err
+			}
+			if c.Optional {
+				return nil
+			}
+			return err
+		}
+		if strings.TrimSpace(c.Interval) != "" {
+			if err := c.sleep(repeatCtx, "interval", c.Interval); err != nil {
+				return err
+			}
+		}
+	}
 }
 
 func cloneVariables(variables map[string]string) map[string]string {
@@ -424,6 +515,9 @@ func (c Command) run(ctx context.Context, r *Runner, index int) error {
 		err = fmt.Errorf("unsupported command type %q", c.Type)
 	}
 	if err != nil {
+		if c.Optional && ctx.Err() == nil && !errors.Is(err, context.Canceled) {
+			return c.sleep(ctx, "wait_after", c.WaitAfter)
+		}
 		return fmt.Errorf("command %d (%s) failed: %w", index, c.Name, err)
 	}
 
@@ -621,6 +715,23 @@ func DataFileReferences(timelines ...Timeline) map[string]struct{} {
 	return used
 }
 
+func TimelineUsesAppium(timeline Timeline) bool {
+	for _, command := range timeline {
+		if command.Type == CommandAppium {
+			return true
+		}
+		for _, raceTimeline := range command.raceTimelines {
+			if TimelineUsesAppium(raceTimeline) {
+				return true
+			}
+		}
+		if TimelineUsesAppium(command.repeatTimeline) {
+			return true
+		}
+	}
+	return false
+}
+
 func collectTimelineDataFileReferences(timeline Timeline, produced map[string]struct{}, used map[string]struct{}) {
 	for _, command := range timeline {
 		for _, key := range command.variableReferences() {
@@ -640,6 +751,7 @@ func collectTimelineDataFileReferences(timeline Timeline, produced map[string]st
 		for _, raceTimeline := range command.raceTimelines {
 			collectTimelineDataFileReferences(raceTimeline, produced, used)
 		}
+		collectTimelineDataFileReferences(command.repeatTimeline, produced, used)
 	}
 }
 
@@ -1429,6 +1541,7 @@ func (r *Runner) ensureAppiumSession(ctx context.Context, c Command) (*appium.Se
 		return nil, err
 	}
 	r.AppiumSession = session
+	r.appiumSessionStarted = true
 	return session, nil
 }
 
@@ -1507,10 +1620,49 @@ func appiumPort(base int, fallback int, index int) int {
 }
 
 func (r *Runner) Close(ctx context.Context) error {
+	var closeErr error
 	if r.AppiumSession == nil {
-		return nil
+		if !r.appiumSessionStarted {
+			return nil
+		}
+		return r.removeAppiumForwards(ctx)
 	}
 	session := r.AppiumSession
 	r.AppiumSession = nil
-	return session.Delete(ctx)
+	r.appiumSessionStarted = true
+	if err := session.Delete(ctx); err != nil {
+		closeErr = err
+	}
+	if err := r.removeAppiumForwards(ctx); err != nil && closeErr == nil {
+		closeErr = err
+	}
+	return closeErr
+}
+
+func (r *Runner) removeAppiumForwards(ctx context.Context) error {
+	if r.Device == nil {
+		return nil
+	}
+	portIndexText := "0"
+	if r.Variables != nil {
+		portIndexText = r.Variables["device.port_index"]
+		if portIndexText == "" {
+			portIndexText = r.Variables["device.index"]
+		}
+	}
+	index, err := strconv.Atoi(portIndexText)
+	if err != nil || index < 0 {
+		return nil
+	}
+
+	var cleanupErr error
+	for _, port := range []int{
+		appiumPort(r.AppiumSystemPortBase, defaultAppiumSystemPortBase, index),
+		appiumPort(r.AppiumMjpegPortBase, defaultAppiumMjpegPortBase, index),
+	} {
+		if _, err := r.Device.RemoveForward(ctx, port); err != nil && cleanupErr == nil {
+			cleanupErr = err
+		}
+	}
+	return cleanupErr
 }

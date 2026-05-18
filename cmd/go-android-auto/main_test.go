@@ -182,6 +182,16 @@ func TestTimelineUsesAppium(t *testing.T) {
 	require.False(t, timelineUsesAppium(nil))
 	require.False(t, timelineUsesAppium(auto.Timeline{{Type: auto.CommandADB}}))
 	require.True(t, timelineUsesAppium(auto.Timeline{{Type: auto.CommandAppium}}))
+	require.True(t, timelineUsesAppium(mustLoadTimeline(t, `
+- type: timeline
+  action: repeat
+  optional: true
+  timeline: child.yaml
+`, map[string]string{"child.yaml": `
+- type: appium
+  action: wait
+  find: '//android.view.ViewGroup[@content-desc="Patrocinado"]'
+`})))
 }
 
 func TestAppiumServerArgsUsesConfiguredURL(t *testing.T) {
@@ -733,6 +743,21 @@ func setTestConfigHome(t *testing.T) appConfigPaths {
 	paths, err := defaultAppConfigPaths()
 	require.NoError(t, err)
 	return paths
+}
+
+func mustLoadTimeline(t *testing.T, root string, children map[string]string) auto.Timeline {
+	t.Helper()
+	dir := t.TempDir()
+	rootPath := filepath.Join(dir, "root.yaml")
+	require.NoError(t, os.WriteFile(rootPath, []byte(root), 0o644))
+	for name, content := range children {
+		path := filepath.Join(dir, name)
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+		require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+	}
+	timeline, err := auto.Load(rootPath)
+	require.NoError(t, err)
+	return timeline
 }
 
 func writeDigitScreenshot(t *testing.T) string {

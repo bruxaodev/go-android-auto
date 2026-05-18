@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -121,7 +122,8 @@ type deviceMapFile struct {
 
 func main() {
 	log.SetFlags(0)
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
 	if len(os.Args) == 1 {
 		if err := runTUI(ctx); err != nil {
 			log.Fatal(err)
@@ -1700,12 +1702,7 @@ func (p *appiumServerPool) Close() error {
 }
 
 func timelineUsesAppium(timeline auto.Timeline) bool {
-	for _, command := range timeline {
-		if command.Type == auto.CommandAppium {
-			return true
-		}
-	}
-	return false
+	return auto.TimelineUsesAppium(timeline)
 }
 
 func appiumServerArgs(serverURL string) ([]string, error) {

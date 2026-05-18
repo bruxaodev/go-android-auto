@@ -206,6 +206,23 @@ func (d *Device) Pull(ctx context.Context, remotepath, localpath string) (Comman
 	return result, nil
 }
 
+func (d *Device) RemoveForward(ctx context.Context, localPort int) (CommandResult, error) {
+	if localPort <= 0 {
+		return CommandResult{}, fmt.Errorf("local port must be greater than 0")
+	}
+
+	target := "tcp:" + strconv.Itoa(localPort)
+	result, err := d.adb(ctx, "-s", d.Serial, "forward", "--remove", target)
+	if err != nil {
+		if isForwardNotFound(result) {
+			return result, nil
+		}
+		return result, commandError("remove forward", d.Serial, []string{target}, result, err)
+	}
+
+	return result, nil
+}
+
 func (d *Device) Screenshot(ctx context.Context, localpath string) (CommandResult, error) {
 	if result, err := d.execOutScreenshot(ctx, localpath); err == nil {
 		return result, nil
@@ -268,4 +285,9 @@ func isResultError(result CommandResult) error {
 	}
 
 	return nil
+}
+
+func isForwardNotFound(result CommandResult) bool {
+	combined := strings.ToLower(strings.TrimSpace(strings.Join([]string{result.Stdout, result.Stderr}, "\n")))
+	return strings.Contains(combined, "not found")
 }
